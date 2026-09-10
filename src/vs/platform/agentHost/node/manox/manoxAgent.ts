@@ -141,15 +141,25 @@ export class ManoxAgent extends Disposable implements IAgent {
 				return;
 			}
 			this._models.set(models.map((m: {
-				id?: unknown; name?: unknown; contextWindow?: unknown; context_window?: unknown;
-			}) => ({
-				provider: MANOX_AGENT_PROVIDER_ID,
-				id: String(m.id),
-				name: String(m.name ?? m.id),
-				maxContextWindow: typeof m.contextWindow === 'number' ? m.contextWindow
-					: typeof m.context_window === 'number' ? m.context_window : undefined,
-				supportsVision: false,
-			})), undefined);
+				id?: unknown; name?: unknown; provider?: unknown; api?: unknown;
+				contextWindow?: unknown; context_window?: unknown;
+			}) => {
+				const rawId = String(m.id);
+				const provider = typeof m.provider === 'string' ? m.provider : '';
+				// Registration-qualified reference (`provider/id`): wire variants of
+				// one model share the bare id, and manox's resolve_model_ref pins
+				// the exact registration only for this form — the picker must send
+				// it so the user's wire choice survives changeModel/initialModel.
+				const api = typeof m.api === 'string' ? m.api : '';
+				return {
+					provider: MANOX_AGENT_PROVIDER_ID,
+					id: provider ? `${provider}/${rawId}` : rawId,
+					name: api ? `${String(m.name ?? rawId)} · ${api}` : String(m.name ?? rawId),
+					maxContextWindow: typeof m.contextWindow === 'number' ? m.contextWindow
+						: typeof m.context_window === 'number' ? m.context_window : undefined,
+					supportsVision: false,
+				};
+			}), undefined);
 		} catch (err) {
 			this._logService.warn('[manox] listModels failed', err);
 		}
