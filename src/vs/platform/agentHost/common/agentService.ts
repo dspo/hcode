@@ -359,6 +359,28 @@ export const AgentHostCodexAgentCodexHomeEnvVar = 'CODEX_HOME';
 /** Forwarded extra args for `codex app-server` (JSON-encoded string[]). */
 export const AgentHostCodexAgentBinaryArgsEnvVar = 'VSCODE_AGENT_HOST_CODEX_APP_SERVER_ARGS';
 
+/**
+ * Experimental Manox agent harness. Points at a directory containing the
+ * locally built `manox_napi.node` addon (see the manox repo's
+ * `script/build-napi`). The addon is loaded only when
+ * {@link AgentHostManoxAgentEnabledEnvVar} enables the harness.
+ */
+export const AgentHostManoxSdkRootEnvVar = 'VSCODE_AGENT_HOST_MANOX_SDK_ROOT';
+
+/**
+ * Environment variable gate for the experimental Manox agent harness.
+ * Accepts `'true'` / `'false'`; absent means "default" (`false`).
+ */
+export const AgentHostManoxAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_MANOX_AGENT_ENABLED';
+
+/**
+ * Redirects the manox state root (`MANOX_HOME` inside the agent core):
+ * runtime lock, `threads.db`, session journals, and provider config. Set it
+ * to an isolated directory so the harness never contends for the
+ * `~/.manox/runtime.lock` with a running manox app or another embedded host.
+ */
+export const AgentHostManoxHomeEnvVar = 'VSCODE_AGENT_HOST_MANOX_HOME';
+
 // -- OpenTelemetry settings ------------------------------------------------------
 //
 // The `chat.agentHost.otel.*` namespace surfaces the same exporter knobs the CLI

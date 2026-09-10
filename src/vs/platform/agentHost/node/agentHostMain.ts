@@ -15,7 +15,7 @@ import { URI } from '../../../base/common/uri.js';
 import { generateUuid } from '../../../base/common/uuid.js';
 import * as os from 'os';
 import * as inspector from 'inspector';
-import { AgentHostClaudeAgentEnabledEnvVar, AgentHostCodexAgentCodexHomeEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostIpcChannels, IAgentHostInspectInfo, IAgentHostSocketInfo, IConnectionTrackerService, isAgentEnabled } from '../common/agentService.js';
+import { AgentHostClaudeAgentEnabledEnvVar, AgentHostCodexAgentCodexHomeEnvVar, AgentHostCodexAgentEnabledEnvVar, AgentHostIpcChannels, AgentHostManoxAgentEnabledEnvVar, AgentHostManoxSdkRootEnvVar, IAgentHostInspectInfo, IAgentHostSocketInfo, IConnectionTrackerService, isAgentEnabled } from '../common/agentService.js';
 import { AgentHostCodexEnabledConfigKey, platformRootSchema } from '../common/agentHostSchema.js';
 import { AgentModelRefreshScheduler, MODEL_REFRESH_INTERVAL_MS } from './agentModelRefreshScheduler.js';
 import { AgentService } from './agentService.js';
@@ -27,6 +27,8 @@ import { ClaudeAgent } from './claude/claudeAgent.js';
 import { ClaudeSdkPackage } from './claude/claudeAgentSdkService.js';
 import { CodexAgent, CodexSdkPackage } from './codex/codexAgent.js';
 import { createCodexProviderConfiguration } from './codex/codexProviderConfiguration.js';
+import { ManoxAgent } from './manox/manoxAgent.js';
+import { isManoxAddonAvailable } from './manox/manoxNapiTransport.js';
 import { ByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
 import { IAgentHostProxyResolver } from './agentHostProxyResolver.js';
 import { IAgentSdkDownloader, type IAgentSdkDownloadProgress } from './agentSdkDownloader.js';
@@ -187,6 +189,20 @@ async function startAgentHost(): Promise<void> {
 			};
 			registerCodexIfEnabled();
 			disposables.add(agentConfigurationService.onDidRootConfigChange(registerCodexIfEnabled));
+		}
+		// Experimental Manox harness: opt-in via env vars, requires the locally
+		// built manox napi addon (manox repo `script/build-napi`). There is no
+		// setting surface yet — enable with
+		// VSCODE_AGENT_HOST_MANOX_AGENT_ENABLED=true plus
+		// VSCODE_AGENT_HOST_MANOX_SDK_ROOT (and, recommended,
+		// VSCODE_AGENT_HOST_MANOX_HOME to isolate the manox state root).
+		if (isAgentEnabled(process.env[AgentHostManoxAgentEnabledEnvVar], false)) {
+			const manoxSdkRoot = process.env[AgentHostManoxSdkRootEnvVar];
+			if (isManoxAddonAvailable(manoxSdkRoot)) {
+				providerService.registerProvider(instantiationService.createInstance(ManoxAgent));
+			} else {
+				logService.warn(`Manox agent enabled but no addon found under '${manoxSdkRoot ?? ''}' (${AgentHostManoxSdkRootEnvVar})`);
+			}
 		}
 	} catch (err) {
 		logService.error('Failed to create AgentService', err);
