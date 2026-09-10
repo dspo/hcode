@@ -126,6 +126,7 @@ export class ManoxAgent extends Disposable implements IAgent {
 	async refreshModels(): Promise<void> {
 		try {
 			this._ensureConnected();
+			await this._refreshModelsNow();
 		} catch (err) {
 			this._logService.warn('[manox] refreshModels: not connected', err);
 		}
@@ -136,15 +137,17 @@ export class ManoxAgent extends Disposable implements IAgent {
 			const raw = await this._call('listModels');
 			const models = Array.isArray(raw) ? raw : (raw as { models?: unknown[] })?.models;
 			if (!Array.isArray(models)) {
+				this._logService.warn('[manox] listModels returned an unexpected shape');
 				return;
 			}
 			this._models.set(models.map((m: {
-				id?: unknown; name?: unknown; contextWindow?: unknown;
+				id?: unknown; name?: unknown; contextWindow?: unknown; context_window?: unknown;
 			}) => ({
 				provider: MANOX_AGENT_PROVIDER_ID,
 				id: String(m.id),
 				name: String(m.name ?? m.id),
-				maxContextWindow: typeof m.contextWindow === 'number' ? m.contextWindow : undefined,
+				maxContextWindow: typeof m.contextWindow === 'number' ? m.contextWindow
+					: typeof m.context_window === 'number' ? m.context_window : undefined,
 				supportsVision: false,
 			})), undefined);
 		} catch (err) {
@@ -187,10 +190,13 @@ export class ManoxAgent extends Disposable implements IAgent {
 		// calls are not expected. Fail closed on anything that slips through
 		// rather than stalling the server's 300s adjudication timeout.
 		this._logService.warn(`[manox] unhandled server call '${event.call.method}'; denying`);
-		if (event.call.method === 'approve' && this._transport) {
-			this._transport.reply(event.id, { ok: { allow: false } });
-		} else if (this._transport) {
-			this._transport.reply(event.id, { err: { code: -1, message: 'not supported by the manox agent host' } });
+		if (!this._transport) {
+			return;
+		}
+		if (event.call.method === 'approve') {
+			this._transport.reply(event.id, { allow: false });
+		} else {
+			this._transport.replyError(event.id, 'not supported by the manox agent host');
 		}
 	}
 
@@ -361,13 +367,14 @@ export class ManoxAgent extends Disposable implements IAgent {
 				initialModel: options?.model?.id ?? null,
 				approvalMode: MANOX_APPROVAL_MODE,
 				reasoningEffort: null,
-			}) as { sessionId?: string };
-			if (!response?.sessionId) {
-				throw new Error('[manox] createSession returned no session id');
+			}) as { sessionId?: string; session_id?: string };
+			const sessionId = response?.sessionId ?? response?.session_id;
+			if (!sessionId) {
+				throw new Error(`[manox] createSession returned no session id: ${JSON.stringify(response)}`);
 			}
 			const record: IManoxChatRecord = {
 				chatUri: chat,
-				sessionId: response.sessionId,
+				sessionId,
 				streamId: generateUuid(),
 				history: [],
 				currentTurnId: undefined,

@@ -50,7 +50,7 @@ export interface IManoxRpcError {
 	readonly data?: { readonly code?: string };
 }
 
-export type ManoxOutcome = { readonly ok: unknown } | { readonly err: IManoxRpcError };
+export type ManoxOutcome = { readonly Ok?: unknown } | { readonly Err?: IManoxRpcError };
 
 /** `ServerCall`: the server asks the client to adjudicate or provide data. */
 export interface IManoxServerCall {
@@ -215,11 +215,12 @@ export class ManoxNapiTransport {
 			const pending = this._pending.get(event.id);
 			if (pending) {
 				this._pending.delete(event.id);
-				const outcome = event.outcome as { ok?: unknown; err?: IManoxRpcError };
-				if (outcome.err !== undefined && outcome.err !== null) {
-					pending.reject(new Error(`manox ${event.id}: [${outcome.err.code}] ${outcome.err.message}`));
+				// serde's default Result encoding is externally tagged `Ok`/`Err`.
+				const outcome = event.outcome as { Ok?: unknown; Err?: IManoxRpcError };
+				if (outcome.Err !== undefined && outcome.Err !== null) {
+					pending.reject(new Error(`manox ${event.id}: [${outcome.Err.code}] ${outcome.Err.message}`));
 				} else {
-					pending.resolve(outcome.ok);
+					pending.resolve(outcome.Ok);
 				}
 			}
 			return;
@@ -247,9 +248,14 @@ export class ManoxNapiTransport {
 		this._sendJson({ kind: 'streamOpen', streamId, streamKind: { type: 'followSession', sessionId, maxMessages: maxMessages ?? null } });
 	}
 
-	/** Answer a `FromServer::Request` server call. */
-	reply(id: string, outcome: ManoxOutcome): void {
-		this._sendJson({ kind: 'reply', id, outcome });
+	/** Answer a `FromServer::Request` server call. The reply payload rides the
+	 * same externally tagged `Ok`/`Err` encoding as responses. */
+	reply(id: string, payload: Record<string, unknown>): void {
+		this._sendJson({ kind: 'reply', id, outcome: { Ok: payload } });
+	}
+
+	replyError(id: string, message: string): void {
+		this._sendJson({ kind: 'reply', id, outcome: { Err: { code: -1, message } } });
 	}
 
 	private _sendJson(message: Record<string, unknown>): void {
