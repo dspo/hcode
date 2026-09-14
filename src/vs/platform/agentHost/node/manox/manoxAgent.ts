@@ -10,20 +10,109 @@ import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { localize } from '../../../../nls.js';
 import { ILogService } from '../../../log/common/log.js';
-import { AgentHostManoxHomeEnvVar, AgentHostManoxSdkRootEnvVar } from '../../common/agentService.js';
+import { AgentHostManoxApprovalModeEnvVar, AgentHostManoxHomeEnvVar, AgentHostManoxSdkRootEnvVar } from '../../common/agentService.js';
+import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
+import { createSchema, schemaProperty } from '../../common/agentHostSchema.js';
+import { getReasoningEffortDescription, getReasoningEffortLabel } from '../../common/reasoningEffort.js';
 import { resolveAgentChatContext, type AgentChatMigrationResult, type AgentProvider, type AgentSignal, type IActiveClient, type IAgent, type IAgentCapabilities, type IAgentChatConfigCompletionsParams, type IAgentChatContext, type IAgentChatMetadata, type IAgentChats, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentDescriptor, type IAgentDiscoveredChat, type IAgentHostCapabilities, type IAgentModelInfo, type IAgentResolveChatConfigParams } from '../../common/agent.js';
 import { ActionType, type SessionAction } from '../../common/state/sessionActions.js';
 import type { ChatAction } from '../../common/state/protocol/channels-chat/actions.js';
-import { MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolResultContentType, TurnState, createErrorResponsePart, parseChatUri, type ChatInputAnswer, type ChatInputResponseKind, type ClientPluginCustomization, type Customization, type Message, type MessageAttachment, type ModelSelection, type ResponsePart, type ToolDefinition, type Turn } from '../../common/state/sessionState.js';
+import { ChatInputResponseKind, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolResultContentType, TurnState, createErrorResponsePart, parseChatUri, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, MessageAttachmentKind, ToolCallStatus, type ChatInputAnswer, type ChatInputOption, type ChatInputQuestion, type ChatInputRequest, type ClientPluginCustomization, type Customization, type Message, type MessageAttachment, type ModelSelection, type PendingMessage, type ResponsePart, type ToolCallPendingConfirmationState, type ToolDefinition, type Turn } from '../../common/state/sessionState.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
-import type { ProtectedResourceMetadata } from '../../common/state/protocol/state.js';
-import { ManoxNapiTransport, type ManoxFromServer, type ManoxJournalEntry, type ManoxJournalEvent } from './manoxNapiTransport.js';
+import type { ConfigSchema, ProtectedResourceMetadata } from '../../common/state/protocol/state.js';
+import { ManoxNapiTransport, type IManoxImageAttachment, type ManoxFromServer, type ManoxJournalEntry, type ManoxJournalEvent } from './manoxNapiTransport.js';
 
 const MANOX_AGENT_PROVIDER_ID: AgentProvider = 'manox';
 
-/** Approval mode every manox session is created with. The experiment does
- * not wire tool adjudication into the UI yet, so sessions run ungated. */
-const MANOX_APPROVAL_MODE = 'danger-full-access';
+/** The manox permission vocabulary on the wire (kebab-case). */
+type ManoxApprovalMode = 'read-only' | 'workspace-write' | 'danger-full-access';
+
+const MANOX_APPROVAL_MODES: readonly ManoxApprovalMode[] = ['read-only', 'workspace-write', 'danger-full-access'];
+
+function isManoxApprovalMode(value: unknown): value is ManoxApprovalMode {
+	return typeof value === 'string' && (MANOX_APPROVAL_MODES as readonly string[]).includes(value);
+}
+
+/** Session-default approval mode: the env override, else `workspace-write`
+ * (tool calls outside the granted-root fence surface as approval cards). */
+function manoxDefaultApprovalMode(): ManoxApprovalMode {
+	const raw = process.env[AgentHostManoxApprovalModeEnvVar];
+	return isManoxApprovalMode(raw) ? raw : 'workspace-write';
+}
+
+/** Host auto-approval bucket for a manox tool name (SessionPermissionManager
+ * keys its policy off this; it never gates what the runtime approves). */
+function manoxPermissionKind(toolName: string): 'shell' | 'write' | 'read' | 'custom-tool' {
+	const name = toolName.toLowerCase();
+	if (name.includes('bash') || name.includes('shell') || name.includes('terminal') || name.includes('exec')) {
+		return 'shell';
+	}
+	if (name.includes('edit') || name.includes('write') || name.includes('patch') || name.includes('notebook')) {
+		return 'write';
+	}
+	if (name.startsWith('read') || name.includes('grep') || name.includes('glob') || name.includes('list')) {
+		return 'read';
+	}
+	return 'custom-tool';
+}
+
+/** Best-effort path target for host auto-approval scoping (write tools). */
+function manoxPermissionPath(input: unknown): string | undefined {
+	if (typeof input !== 'object' || input === null) {
+		return undefined;
+	}
+	const record = input as Record<string, unknown>;
+	for (const key of ['file_path', 'filePath', 'notebook_path', 'path', 'file']) {
+		const value = record[key];
+		if (typeof value === 'string' && value) {
+			return value;
+		}
+	}
+	return undefined;
+}
+
+/** Reasoning-effort key in `ModelSelection.config` — the shared picker
+ * contract (mirrors Claude's `thinkingLevel` and Copilot's
+ * `ThinkingLevelConfigKey`) so one picker drives every provider. */
+const MANOX_THINKING_LEVEL_KEY = 'thinkingLevel';
+
+/** The manox wire's closed reasoning-effort vocabulary. */
+type ManoxReasoningEffort = 'high' | 'max';
+
+function manoxThinkingLevelSchema(): ConfigSchema {
+	return {
+		type: 'object',
+		properties: {
+			[MANOX_THINKING_LEVEL_KEY]: {
+				type: 'string',
+				title: localize('manox.modelThinkingLevel.title', "Thinking Level"),
+				description: localize('manox.modelThinkingLevel.description', "Controls how much reasoning effort the Manox agent uses."),
+				enum: ['high', 'max'],
+				enumLabels: ['high', 'max'].map(getReasoningEffortLabel),
+				enumDescriptions: (['high', 'max'] as const).map(effort => getReasoningEffortDescription(effort) ?? ''),
+				default: 'high',
+			},
+		},
+	};
+}
+
+/** Flatten one answered chat-input question into the text manox expects. */
+function manoxAnswerText(answer: ChatInputAnswer | undefined): string | undefined {
+	if (!answer || answer.state === ChatInputAnswerState.Skipped) {
+		return undefined;
+	}
+	const value = answer.value;
+	switch (value.kind) {
+		case ChatInputAnswerValueKind.SelectedMany:
+			return value.value.length ? value.value.join(', ') : undefined;
+		case ChatInputAnswerValueKind.Text:
+		case ChatInputAnswerValueKind.Selected:
+			return value.value || undefined;
+		case ChatInputAnswerValueKind.Number:
+		case ChatInputAnswerValueKind.Boolean:
+			return String(value.value);
+	}
+}
 
 /** How many journal records the opening snapshot window requests. */
 const MANOX_SNAPSHOT_WINDOW = 200;
@@ -48,6 +137,12 @@ interface IManoxChatRecord {
 	reasoningPartId: string | undefined;
 	/** Tool calls announced but not yet completed, for out-of-order results. */
 	readonly startedToolCalls: Set<string>;
+	/** Whether a turn is currently in flight (drives steer-vs-submit). */
+	turnActive: boolean;
+	/** Wall-clock ms of the current turnStart, for ChatTurnComplete duration. */
+	turnStartedAt: number | undefined;
+	/** Live approval-mode mirror (journal permissionModeChange keeps it fresh). */
+	approvalMode: ManoxApprovalMode;
 }
 
 export class ManoxAgent extends Disposable implements IAgent {
@@ -68,6 +163,12 @@ export class ManoxAgent extends Disposable implements IAgent {
 
 	private _transport: ManoxNapiTransport | undefined;
 	private readonly _chats = new Map<string, IManoxChatRecord>();
+	/** Parked approve adjudications; metadata carries the wire reply target. */
+	private readonly _pendingPermissions = new PendingRequestRegistry<boolean, { readonly replyId: string; readonly chat: URI }>();
+	/** Parked askUserQuestion solicitations. */
+	private readonly _pendingUserInputs = new PendingRequestRegistry<{ readonly response: ChatInputResponseKind; readonly answers?: Record<string, ChatInputAnswer> }, { readonly replyId: string }>();
+	/** Active-client handles keyed by `chat::clientId` (stable across fan-outs). */
+	private readonly _activeClients = new Map<string, IActiveClient>();
 
 	constructor(
 		@ILogService private readonly _logService: ILogService,
@@ -162,6 +263,9 @@ export class ManoxAgent extends Disposable implements IAgent {
 					name: api ? `${String(m.name ?? rawId)} · ${api}` : String(m.name ?? rawId),
 					maxContextWindow: typeof m.contextWindow === 'number' ? m.contextWindow
 						: typeof m.context_window === 'number' ? m.context_window : undefined,
+					maxOutputTokens: typeof (m as { max_tokens?: unknown }).max_tokens === 'number'
+						? (m as { max_tokens?: number }).max_tokens : undefined,
+					configSchema: manoxThinkingLevelSchema(),
 					supportsVision: false,
 				};
 			}), undefined);
@@ -201,18 +305,112 @@ export class ManoxAgent extends Disposable implements IAgent {
 	}
 
 	private _handleServerRequest(event: Extract<ManoxFromServer, { kind: 'request' }>): void {
-		// The experiment runs sessions in danger-full-access mode, so approve
-		// calls are not expected. Fail closed on anything that slips through
-		// rather than stalling the server's 300s adjudication timeout.
-		this._logService.warn(`[manox] unhandled server call '${event.call.method}'; denying`);
-		if (!this._transport) {
+		const transport = this._transport;
+		if (!transport) {
 			return;
 		}
-		if (event.call.method === 'approve') {
-			this._transport.reply(event.id, { allow: false });
-		} else {
-			this._transport.replyError(event.id, 'not supported by the manox agent host');
+		const call = event.call;
+		switch (call.method) {
+			case 'approve': {
+				// Park the adjudication and surface it as a pending_confirmation
+				// signal; the host owns the approval policy (auto-approval and
+				// allow-in-session memory live in SessionPermissionManager) and
+				// answers through respondToPermissionRequest. The reply id is
+				// the wire MsgId (the server keys the parked waiter on it).
+				const record = call.sessionId ? this._recordForSession(call.sessionId) : undefined;
+				const authId = call.authId ?? event.id;
+				if (!record) {
+					this._logService.warn(`[manox] approve for unknown session '${call.sessionId}'; denying`);
+					transport.reply(event.id, { allow: false });
+					return;
+				}
+				const state: ToolCallPendingConfirmationState = {
+					status: ToolCallStatus.PendingConfirmation,
+					toolCallId: authId,
+					toolName: call.toolName ?? 'manox tool',
+					displayName: call.toolName ?? 'manox tool',
+					invocationMessage: call.summary ?? call.toolName ?? 'manox tool',
+					...(call.input !== undefined ? { toolInput: JSON.stringify(call.input, undefined, 2) } : {}),
+				};
+				void this._pendingPermissions
+					.registerAndFire(authId, () => {
+						this._onDidChatProgress.fire({
+							kind: 'pending_confirmation',
+							chat: record.chatUri,
+							state,
+							permissionKind: manoxPermissionKind(state.toolName),
+							...(manoxPermissionPath(call.input) !== undefined ? { permissionPath: manoxPermissionPath(call.input) } : {}),
+						});
+					}, { replyId: event.id, chat: record.chatUri })
+					.then(allow => transport.reply(event.id, { allow }));
+				return;
+			}
+			case 'askUserQuestion': {
+				const record = call.sessionId ? this._recordForSession(call.sessionId) : undefined;
+				const authId = call.authId ?? event.id;
+				if (!record) {
+					transport.replyError(event.id, 'unknown session');
+					return;
+				}
+				const input = (call.input ?? {}) as { questions?: readonly { question?: unknown; header?: unknown; multiSelect?: unknown; options?: readonly { label?: unknown; description?: unknown; recommended?: unknown }[] }[] };
+				const questions: ChatInputQuestion[] = [];
+				for (const [index, question] of (input.questions ?? []).entries()) {
+					const options: ChatInputOption[] = (question.options ?? []).map((option, optionIndex) => ({
+						id: String(optionIndex),
+						label: typeof option.label === 'string' ? option.label : `Option ${optionIndex + 1}`,
+						...(typeof option.description === 'string' ? { description: option.description } : {}),
+						...(option.recommended === true ? { recommended: true } : {}),
+					}));
+					questions.push({
+						kind: question.multiSelect === true ? ChatInputQuestionKind.MultiSelect : ChatInputQuestionKind.SingleSelect,
+						id: `manox-q${index}`,
+						...(typeof question.header === 'string' ? { title: question.header } : {}),
+						message: typeof question.question === 'string' ? question.question : `Question ${index + 1}`,
+						options,
+					});
+				}
+				const request: ChatInputRequest = {
+					id: authId,
+					message: localize('manoxAgent.questionPrompt', "The Manox agent needs your input"),
+					questions,
+				};
+				void this._pendingUserInputs
+					.registerAndFire(authId, () => {
+						this._fire(record, { type: ActionType.ChatInputRequested, request });
+					}, { replyId: event.id })
+					.then(result => {
+						// manox expects `answers: [[question, answer], ...]`; a
+						// decline/cancel maps to an empty list (the model reads a
+						// non-answer) rather than an Err, which would read as expiry.
+						const answers: Array<[string, string]> = [];
+						if (result.response === ChatInputResponseKind.Accept) {
+							for (const [questionId, answer] of Object.entries(result.answers ?? {})) {
+								const question = questions.find(candidate => candidate.id === questionId);
+								const text = manoxAnswerText(answer);
+								if (question && text !== undefined) {
+									answers.push([question.message, text]);
+								}
+							}
+						}
+						transport.reply(event.id, { answers, response: null });
+					});
+				return;
+			}
+			default:
+				// Fail closed rather than stalling the server's 300s timeout:
+				// browserOp is undeclared (never routed); clipboardRead /
+				// openExternal / invokeClientTool / planVerdict arrive once the
+				// corresponding bridge lands.
+				this._logService.warn(`[manox] unhandled server call '${call.method}'; denying`);
+				transport.replyError(event.id, 'not supported by the manox agent host');
 		}
+	}
+
+	private _recordForSession(sessionId: string | undefined): IManoxChatRecord | undefined {
+		if (!sessionId) {
+			return undefined;
+		}
+		return [...this._chats.values()].find(record => record.sessionId === sessionId);
 	}
 
 	private _handleStreamItem(event: Extract<ManoxFromServer, { kind: 'streamItem' }>): void {
@@ -278,8 +476,11 @@ export class ManoxAgent extends Disposable implements IAgent {
 
 	private _endTurn(record: IManoxChatRecord): void {
 		if (record.currentTurnId || record.fallbackTurnId) {
-			this._fire(record, { type: ActionType.ChatTurnComplete, turnId: this._turnId(record), duration: 1 });
+			const duration = record.turnStartedAt !== undefined ? Math.max(1, Date.now() - record.turnStartedAt) : 1;
+			this._fire(record, { type: ActionType.ChatTurnComplete, turnId: this._turnId(record), duration });
 		}
+		record.turnActive = false;
+		record.turnStartedAt = undefined;
 		record.currentTurnId = undefined;
 		record.fallbackTurnId = undefined;
 		record.textPartId = undefined;
@@ -290,6 +491,8 @@ export class ManoxAgent extends Disposable implements IAgent {
 	private _dispatchJournalEvent(record: IManoxChatRecord, event: ManoxJournalEvent): void {
 		switch (event.type) {
 			case 'turnStart':
+				record.turnActive = true;
+				record.turnStartedAt = Date.now();
 				this._turnId(record);
 				return;
 			case 'agentTextDelta': {
@@ -307,6 +510,14 @@ export class ManoxAgent extends Disposable implements IAgent {
 					return;
 				}
 				record.startedToolCalls.add(event.callId);
+				if (event.status === 'pending-approval') {
+					// The approval card is driven by the `approve` server call
+					// (parked in _handleServerRequest); this row only announces
+					// the call. The host dispatches ChatToolCallReady from the
+					// pending_confirmation signal, so firing one here as well
+					// would bypass the approval pipeline.
+					return;
+				}
 				const turnId = this._turnId(record);
 				this._fire(record, {
 					type: ActionType.ChatToolCallStart,
@@ -366,6 +577,15 @@ export class ManoxAgent extends Disposable implements IAgent {
 				// Session-scoped action: address the session, not the chat channel.
 				this._fireToSession(record, { type: ActionType.SessionTitleChanged, title: event.title });
 				return;
+			case 'permissionModeChange':
+				if (isManoxApprovalMode(event.mode)) {
+					record.approvalMode = event.mode;
+				}
+				return;
+			case 'approval':
+				// Journal mirror of the adjudication the approve server call
+				// already drove; the card's lifecycle is host-owned.
+				return;
 		}
 	}
 
@@ -381,12 +601,18 @@ export class ManoxAgent extends Disposable implements IAgent {
 			// kernel's granted-root fence (dspo/manox#787), persisted in the
 			// session sidecar so restores replay it.
 			const extraWorkingDirectories = options?.workingDirectories?.slice(1).map(uri => uri.fsPath) ?? [];
+			// The session-config picker's value wins; absent falls to the env
+			// default (workspace-write). Mid-session switches are not wired yet
+			// (the host applies session config at creation; no write-back hook
+			// exists for providers), so the mode is fixed per session.
+			const configuredMode = options?.config?.permissionMode;
+			const approvalMode: ManoxApprovalMode = isManoxApprovalMode(configuredMode) ? configuredMode : manoxDefaultApprovalMode();
 			const response = await transport.call('createSession', {
 				cwd: workingDirectory?.fsPath ?? null,
 				workingDirectories: extraWorkingDirectories,
 				project: null,
 				initialModel: options?.model?.id ?? null,
-				approvalMode: MANOX_APPROVAL_MODE,
+				approvalMode,
 				reasoningEffort: null,
 			}) as { sessionId?: string; session_id?: string };
 			const sessionId = response?.sessionId ?? response?.session_id;
@@ -403,6 +629,9 @@ export class ManoxAgent extends Disposable implements IAgent {
 				textPartId: undefined,
 				reasoningPartId: undefined,
 				startedToolCalls: new Set(),
+				turnActive: false,
+				turnStartedAt: undefined,
+				approvalMode,
 			};
 			this._chats.set(chat.toString(), record);
 			transport.openStream(record.streamId, record.sessionId, MANOX_SNAPSHOT_WINDOW);
@@ -419,6 +648,11 @@ export class ManoxAgent extends Disposable implements IAgent {
 				return;
 			}
 			this._chats.delete(chat.toString());
+			// Settle the chat's parked adjudications before tearing down: a
+			// deny lets the server's waterfall fail closed immediately instead
+			// of waiting out its 300s timeout; user-input asks cancel.
+			this._pendingPermissions.respondWhere(meta => meta.chat.toString() === chat.toString(), false);
+			this._pendingUserInputs.denyAll({ response: ChatInputResponseKind.Cancel });
 			this._transport?.sendNote({ method: 'disposeSession', sessionId: record.sessionId });
 		},
 
@@ -433,8 +667,31 @@ export class ManoxAgent extends Disposable implements IAgent {
 			if (!record) {
 				throw new Error(`[manox] no backing session for ${chat.toString()}`);
 			}
-			if (attachments?.length) {
-				this._logService.warn('[manox] message attachments are not supported yet; dropping');
+			// Images ride the wire's ImageAttachment (base64 + mime); textual
+			// references are appended to the prompt; anything else is dropped
+			// with a warning rather than silently ignored.
+			const images: IManoxImageAttachment[] = [];
+			const referenceTexts: string[] = [];
+			for (const attachment of attachments ?? []) {
+				switch (attachment.type) {
+					case MessageAttachmentKind.EmbeddedResource:
+						if (/^image\//i.test(attachment.contentType)) {
+							images.push({ data: attachment.data, mimeType: attachment.contentType });
+						} else {
+							this._logService.warn(`[manox] dropping embedded attachment of type ${attachment.contentType}`);
+						}
+						break;
+					case MessageAttachmentKind.Resource:
+						referenceTexts.push(`Attached resource: ${attachment.uri.toString()}`);
+						break;
+					case MessageAttachmentKind.Simple:
+						if (attachment.modelRepresentation) {
+							referenceTexts.push(`Attachment: ${attachment.modelRepresentation}`);
+						}
+						break;
+					default:
+						this._logService.warn(`[manox] dropping attachment of kind ${attachment.type}`);
+				}
 			}
 			record.currentTurnId = turnId;
 			record.fallbackTurnId = undefined;
@@ -442,8 +699,8 @@ export class ManoxAgent extends Disposable implements IAgent {
 			record.reasoningPartId = undefined;
 			const receipt = await this._call('submit', {
 				sessionId: record.sessionId,
-				text: prompt,
-				images: [],
+				text: referenceTexts.length ? `${prompt}\n\n${referenceTexts.join('\n')}` : prompt,
+				images,
 				originRpc: null,
 			}) as { accepted?: boolean };
 			if (receipt?.accepted === false) {
@@ -462,6 +719,12 @@ export class ManoxAgent extends Disposable implements IAgent {
 			const record = this._chats.get(chat.toString());
 			if (record) {
 				this._transport?.sendNote({ method: 'setModel', sessionId: record.sessionId, id: model.id });
+				// The picker's per-model form carries the effort pick under the
+				// shared thinkingLevel key; manox's wire vocabulary is high|max.
+				const effort = model.config?.[MANOX_THINKING_LEVEL_KEY];
+				if (effort === 'high' || effort === 'max') {
+					this._transport?.setReasoningEffort(record.sessionId, effort satisfies ManoxReasoningEffort);
+				}
 			}
 		},
 
@@ -493,11 +756,14 @@ export class ManoxAgent extends Disposable implements IAgent {
 			textPartId: undefined,
 			reasoningPartId: undefined,
 			startedToolCalls: new Set(),
+			turnActive: false,
+			turnStartedAt: undefined,
+			approvalMode: manoxDefaultApprovalMode(),
 		};
-		const response = await transport.call('openSession', { sessionId: providerData }) as { records?: ManoxJournalEntry[] };
-		if (Array.isArray(response?.records)) {
-			record.history.push(...response.records);
-		}
+		// Attach server-side (replays any parked adjudications to this owner);
+		// the answer is only `{restored: true}` — history arrives through the
+		// follow stream's snapshot frame below.
+		await transport.call('openSession', { sessionId: providerData });
 		this._chats.set(chat.toString(), record);
 		transport.openStream(record.streamId, providerData, MANOX_SNAPSHOT_WINDOW);
 	}
@@ -505,7 +771,35 @@ export class ManoxAgent extends Disposable implements IAgent {
 	// ---- Config / metadata / auth stubs ---------------------------------------
 
 	async resolveChatConfig(params: IAgentResolveChatConfigParams): Promise<ResolveSessionConfigResult> {
-		return { schema: { type: 'object', properties: {} }, values: params.config ?? {} };
+		// The single manox-specific knob: the sandbox approval mode, applied
+		// at session creation (createChat reads options.config.permissionMode).
+		// Not sessionMutable yet — the platform has no provider write-back
+		// hook for mid-session config changes, so advertising mutability would
+		// render a picker that lies.
+		const sessionSchema = createSchema({
+			permissionMode: schemaProperty<ManoxApprovalMode>({
+				type: 'string',
+				title: localize('manox.sessionConfig.approvalMode', "Approvals"),
+				description: localize('manox.sessionConfig.approvalModeDescription', "How the Manox agent gates tool calls. Writes outside the granted working directories ask for approval."),
+				enum: ['read-only', 'workspace-write', 'danger-full-access'],
+				enumLabels: [
+					localize('manox.sessionConfig.approvalMode.readOnly', "Read Only"),
+					localize('manox.sessionConfig.approvalMode.workspaceWrite', "Workspace Write"),
+					localize('manox.sessionConfig.approvalMode.dangerFullAccess', "Full Access"),
+				],
+				enumDescriptions: [
+					localize('manox.sessionConfig.approvalMode.readOnlyDescription', "The agent cannot modify files."),
+					localize('manox.sessionConfig.approvalMode.workspaceWriteDescription', "Writes inside the granted working directories are automatic; everything else asks first."),
+					localize('manox.sessionConfig.approvalMode.dangerFullAccessDescription', "All tools run without asking."),
+				],
+				default: 'workspace-write',
+				sessionMutable: false,
+			}),
+		});
+		const values = sessionSchema.validateOrDefault(params.config ?? {}, {
+			permissionMode: manoxDefaultApprovalMode(),
+		});
+		return { schema: sessionSchema.toProtocol(), values };
 	}
 
 	getInheritedChatConfig(): Record<string, unknown> | undefined {
@@ -529,7 +823,35 @@ export class ManoxAgent extends Disposable implements IAgent {
 	}
 
 	async getChatMetadata(chat: URI): Promise<IAgentChatMetadata | undefined> {
-		return { chat, startTime: Date.now(), modifiedTime: Date.now() };
+		const record = this._chats.get(chat.toString());
+		if (!record) {
+			// No live backing: let the host fall back to its registry values
+			// instead of fabricating timestamps that advance on every call.
+			return undefined;
+		}
+		const first = record.history[0];
+		const last = record.history[record.history.length - 1];
+		const modifiedTime = last ? (Date.parse(last.timestamp) || Date.now()) : Date.now();
+		let enrichment: { summary?: string; workingDirectories?: readonly URI[]; model?: ModelSelection } = {};
+		try {
+			const info = await this._transport?.getConversationInfo(record.sessionId);
+			if (info) {
+				enrichment = {
+					...(info.title ? { summary: info.title } : {}),
+					...(info.cwd ? { workingDirectories: [URI.file(info.cwd), ...(info.project && info.project !== info.cwd ? [URI.file(info.project)] : [])] } : {}),
+					...(info.model ? { model: { id: info.model } satisfies ModelSelection } : {}),
+				};
+			}
+		} catch {
+			// Best-effort enrichment; the journal-derived timestamps above
+			// already satisfy the contract when the info call fails.
+		}
+		return {
+			chat,
+			startTime: first ? (Date.parse(first.timestamp) || modifiedTime) : modifiedTime,
+			modifiedTime,
+			...enrichment,
+		};
 	}
 
 	getProtectedResources(): ProtectedResourceMetadata[] {
@@ -540,40 +862,86 @@ export class ManoxAgent extends Disposable implements IAgent {
 		return true;
 	}
 
-	getOrCreateActiveClient(_chat: URI, _context: URI | IAgentChatContext, client: { readonly clientId: string; readonly displayName?: string }): IActiveClient {
-		let tools: readonly ToolDefinition[] = [];
-		let customizations: readonly ClientPluginCustomization[] = [];
-		return {
-			clientId: client.clientId,
-			displayName: client.displayName,
-			get tools() { return tools; },
-			set tools(value: readonly ToolDefinition[]) { tools = value; },
-			get customizations() { return customizations; },
-			set customizations(value: readonly ClientPluginCustomization[]) { customizations = value; },
-		};
+	getOrCreateActiveClient(chat: URI, _context: URI | IAgentChatContext, client: { readonly clientId: string; readonly displayName?: string }): IActiveClient {
+		// One stable handle per (chat, clientId): the host fans out handle
+		// updates repeatedly and `removeActiveClient` must be able to retire
+		// the exact live registration.
+		const key = `${chat.toString()}::${client.clientId}`;
+		let handle = this._activeClients.get(key);
+		if (!handle) {
+			let tools: readonly ToolDefinition[] = [];
+			let customizations: readonly ClientPluginCustomization[] = [];
+			handle = {
+				clientId: client.clientId,
+				displayName: client.displayName,
+				get tools() { return tools; },
+				set tools(value: readonly ToolDefinition[]) { tools = value; },
+				get customizations() { return customizations; },
+				set customizations(value: readonly ClientPluginCustomization[]) { customizations = value; },
+			};
+			this._activeClients.set(key, handle);
+		}
+		return handle;
 	}
 
-	removeActiveClient(): void { }
+	removeActiveClient(chat: URI, _context: URI | IAgentChatContext, clientId: string): void {
+		this._activeClients.delete(`${chat.toString()}::${clientId}`);
+	}
 
 	onClientToolCallComplete(): void { }
 
-	respondToPermissionRequest(_requestId: string, _approved: boolean): void {
-		// Sessions run with danger-full-access; adjudication is denied in
-		// _handleServerRequest, so nothing pending exists to respond to.
+	/** Turn steering: forwarded as a wire steer only while a turn runs (a
+	 * no-turn steer degrades to a fresh submit server-side and would double-
+	 * send). Queued messages are host-consumed and never reach the agent. */
+	setPendingMessages(chat: URI, steeringMessage: PendingMessage | undefined, _queuedMessages: readonly PendingMessage[]): void {
+		const record = this._chats.get(chat.toString());
+		if (!record || !record.turnActive || !steeringMessage) {
+			return;
+		}
+		try {
+			void this._ensureConnected().steer({
+				sessionId: record.sessionId,
+				messageId: steeringMessage.id,
+				text: steeringMessage.message.text,
+				images: [],
+			}).then(receipt => {
+				if (receipt.accepted) {
+					this._onDidChatProgress.fire({ kind: 'steering_consumed', chat: record.chatUri, id: steeringMessage.id });
+				}
+			});
+		} catch (err) {
+			this._logService.warn('[manox] steer failed', err);
+		}
 	}
 
-	respondToUserInputRequest(_requestId: string, _response: ChatInputResponseKind, _answers?: Record<string, ChatInputAnswer>): void { }
+	respondToPermissionRequest(requestId: string, approved: boolean): void {
+		this._pendingPermissions.respond(requestId, approved);
+	}
+
+	respondToUserInputRequest(requestId: string, response: ChatInputResponseKind, answers?: Record<string, ChatInputAnswer>): void {
+		this._pendingUserInputs.respond(requestId, { response, answers });
+	}
 
 	async shutdown(): Promise<void> {
 		await this._transport?.dispose();
 		this._transport = undefined;
+		this._settleAllPending();
 	}
 
 	override dispose(): void {
 		void this._transport?.dispose();
 		this._transport = undefined;
+		this._settleAllPending();
 		this._chats.clear();
 		super.dispose();
+	}
+
+	/** Deny every parked adjudication and cancel every parked question — the
+	 * wire replies can no longer be delivered once the transport is gone, but
+	 * settling keeps the host-side awaiters from hanging. */
+	private _settleAllPending(): void {
+		this._pendingPermissions.denyAll(false);
+		this._pendingUserInputs.denyAll({ response: ChatInputResponseKind.Cancel });
 	}
 }
 

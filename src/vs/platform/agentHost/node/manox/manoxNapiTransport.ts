@@ -15,6 +15,17 @@ import { createRequire } from 'node:module';
  * Only the wire vocabulary the harness consumes is typed here; the Rust side
  * is envelope-generic (unknown frames are logged and dropped, never fatal),
  * so a protocol bump degrades to missing features instead of a crash.
+ *
+ * Casing traps (verified against manox-protocol at PROTOCOL_EPOCH 6): the
+ * typed enums (journal events, server calls, host events) are serde
+ * camelCase, but hand-written `json!()` payloads are snake_case —
+ * createSession/forkSession answer `{session_id}`, submit/steer receipts
+ * `{accepted, message_id}`, pageHistory `{records, has_more, cursor}`,
+ * ThreadListItem/ModelInfo fields, ClientToolSpec (`input_schema`,
+ * `read_only`) and the commands list are snake_case, and the
+ * `metrics` token-usage data is snake_case bare serde. Only
+ * `getConversationInfo` and the assistant-message `usage` payload are
+ * hand-written camelCase.
  */
 
 /** Loaded from `VSCODE_AGENT_HOST_MANOX_SDK_ROOT` (dir or .node file path). */
@@ -54,7 +65,7 @@ export type ManoxOutcome = { readonly Ok?: unknown } | { readonly Err?: IManoxRp
 
 /** `ServerCall`: the server asks the client to adjudicate or provide data. */
 export interface IManoxServerCall {
-	readonly method: 'approve' | 'planVerdict' | 'askUserQuestion' | 'browserOp' | 'clipboardRead' | 'openExternal';
+	readonly method: 'approve' | 'planVerdict' | 'askUserQuestion' | 'browserOp' | 'clipboardRead' | 'openExternal' | 'invokeClientTool';
 	readonly deliveryId?: string;
 	readonly sessionId?: string;
 	readonly authId?: string;
@@ -63,19 +74,96 @@ export interface IManoxServerCall {
 	readonly input?: unknown;
 	readonly planFile?: string;
 	readonly title?: string;
+	/** planVerdict: the plan markdown; null when the server failed to read the file. */
+	readonly content?: string | null;
+	/** openExternal: the URL to open. */
+	readonly url?: string;
+	/** invokeClientTool: routed only to the client that registered the tool. */
+	readonly clientId?: string;
+	readonly toolCallId?: string;
+	/** invokeClientTool: the registered (original) tool name. */
+	readonly name?: string;
+}
+
+/** `ThreadListItem` (snake_case on the wire; manox-protocol wire.rs). */
+export interface IManoxThreadListItem {
+	readonly id: string;
+	readonly title: string;
+	/** Unix seconds of the last human prompt or steer. */
+	readonly updated_at: number;
+	readonly running: boolean;
+	/** Deprecated on the wire: always false; derive from SessionStatus deltas. */
+	readonly unread: boolean;
+	readonly errored: boolean;
+	readonly pending_auth: boolean;
+	readonly pending_plan: boolean;
+	readonly background_work: boolean;
+	readonly model_id: string;
+	readonly pinned: boolean;
+	readonly archived: boolean;
+	readonly parent_id: string | null;
+	readonly depth: number;
+	readonly project?: string;
+	readonly tag?: string;
+	readonly approval_mode?: number;
+}
+
+/** One row of the commands list (snake_case; `argument_hint`/`i18n_key`). */
+export interface IManoxCommandInfo {
+	readonly name: string;
+	readonly description: string | null;
+	readonly kind: 'command' | 'skill';
+	readonly argument_hint?: string | null;
+	/** Builtins only: localization key for the description. */
+	readonly i18n_key?: string;
+}
+
+export interface IManoxTerminalSummary {
+	readonly id: string;
+	readonly title?: string | null;
+	readonly lifecycle: 'running' | 'exited';
+	readonly exitCode?: number | null;
+}
+
+/** Image attachment on submit/steer (base64 bytes + mime). */
+export interface IManoxImageAttachment {
+	readonly data: string;
+	readonly mimeType: string;
+}
+
+/** Client-contributed session tool registration (snake_case schema fields). */
+export interface IManoxClientToolSpec {
+	readonly name: string;
+	readonly description: string;
+	readonly input_schema: unknown;
+	readonly read_only?: boolean;
+}
+
+/** `getConversationInfo` response (hand-written camelCase). */
+export interface IManoxConversationInfo {
+	readonly threadId: string;
+	readonly cursor: number;
+	readonly title: string | null;
+	readonly cwd: string;
+	readonly project: string | null;
+	readonly model: string | null;
+	readonly contextWindow: number | null;
+	readonly turns: number;
+	readonly messages: number;
 }
 
 /** `HostEvent`: global change-driven broadcasts (manox spec D.5). */
 export type ManoxHostEvent =
 	| { readonly type: 'ready'; readonly epoch: number }
 	| { readonly type: 'models'; readonly models: readonly IManoxModelInfo[] }
-	| { readonly type: 'commands'; readonly commands: unknown }
-	| { readonly type: 'threadsUpdated'; readonly threads: readonly unknown[] }
+	| { readonly type: 'commands'; readonly commands: readonly IManoxCommandInfo[] }
+	| { readonly type: 'threadsUpdated'; readonly threads: readonly IManoxThreadListItem[] }
 	| { readonly type: 'sessionStatus'; readonly sessionId: string; readonly running?: boolean | null; readonly errored?: boolean | null; readonly unread?: boolean | null; readonly pendingAuth?: boolean | null; readonly pendingPlan?: boolean | null; readonly backgroundWork?: boolean | null }
-	| { readonly type: 'sessionCreated'; readonly sessionId: string }
+	| { readonly type: 'sessionCreated'; readonly sessionId: string; readonly header?: { readonly id: string; readonly cwd: string; readonly parentSession?: string | null; readonly metadata?: unknown; readonly createdAt: string } }
 	| { readonly type: 'sessionDisposed'; readonly sessionId: string }
 	| { readonly type: 'error'; readonly message: string; readonly sessionId?: string | null }
-	| { readonly type: 'projects'; readonly known: readonly string[] };
+	| { readonly type: 'projects'; readonly known: readonly string[] }
+	| { readonly type: 'terminalsUpdated'; readonly terminals: readonly IManoxTerminalSummary[] };
 
 export interface IManoxModelInfo {
 	readonly id: string;
@@ -87,9 +175,35 @@ export interface IManoxModelInfo {
 	readonly maxTokens?: number;
 }
 
+/** `toolCall.status` vocabulary (kebab-case on the wire). */
+export type ManoxToolCallStatus = 'pending-approval' | 'running' | 'success' | 'continued' | 'error' | 'denied' | 'cancelled';
+
+/** Assistant-message usage payload (hand-written camelCase). */
+export interface IManoxMessageUsage {
+	readonly input?: number;
+	readonly output?: number;
+	readonly cacheRead?: number;
+	readonly cacheWrite?: number;
+	readonly reasoning?: number;
+}
+
+/** `metrics{kind:'token_usage'}` data (snake_case bare serde; zero-fields omitted). */
+export interface IManoxTokenUsageData {
+	readonly input_tokens?: number;
+	readonly output_tokens?: number;
+	readonly cache_creation_input_tokens?: number;
+	readonly cache_read_input_tokens?: number;
+}
+
+/** `planUpdate.snapshot` (kernel PlanSnapshot; step status snake_case). */
+export interface IManoxPlanSnapshot {
+	readonly explanation: string | null;
+	readonly steps: readonly { readonly step: string; readonly status: 'pending' | 'in_progress' | 'completed' }[];
+}
+
 /** `JournalWireEvent`, tagged `type` (manox spec C.2 vocabulary). Fields are camelCase. */
 export type ManoxJournalEvent =
-	| { readonly type: 'message'; readonly role: string; readonly content: readonly unknown[]; readonly usage?: unknown; readonly originRpc?: string | null }
+	| { readonly type: 'message'; readonly role: string; readonly content: readonly unknown[]; readonly usage?: IManoxMessageUsage; readonly originRpc?: string | null; readonly display?: boolean }
 	| { readonly type: 'uiNote'; readonly kind: string; readonly data: unknown }
 	| { readonly type: 'custom'; readonly customType: string; readonly data: unknown }
 	| { readonly type: 'customMessage'; readonly customType: string; readonly content: readonly unknown[]; readonly display: boolean }
@@ -100,7 +214,7 @@ export type ManoxJournalEvent =
 	| { readonly type: 'error'; readonly message: string }
 	| { readonly type: 'agentTextDelta'; readonly s: string }
 	| { readonly type: 'agentThinkingDelta'; readonly s: string }
-	| { readonly type: 'toolCall'; readonly callId: string; readonly name: string; readonly title: string; readonly status: string; readonly input: unknown }
+	| { readonly type: 'toolCall'; readonly callId: string; readonly name: string; readonly title: string; readonly status: ManoxToolCallStatus; readonly input: unknown }
 	| { readonly type: 'toolResult'; readonly callId: string; readonly output: string; readonly isError: boolean }
 	| { readonly type: 'toolOutputChunk'; readonly callId: string; readonly chunk: string }
 	| { readonly type: 'subagentChild'; readonly agentId: string; readonly event: unknown }
@@ -111,18 +225,18 @@ export type ManoxJournalEvent =
 	| { readonly type: 'reasoningEffortChange'; readonly effort: string }
 	| { readonly type: 'planModeChange'; readonly enabled: boolean }
 	| { readonly type: 'title'; readonly title: string }
-	| { readonly type: 'approval'; readonly kind: string; readonly authId: string; readonly toolName?: string | null; readonly toolCallId?: string | null; readonly verdict?: string | null; readonly reason?: string | null }
+	| { readonly type: 'approval'; readonly kind: 'request' | 'decision'; readonly authId: string; readonly toolName?: string | null; readonly toolCallId?: string | null; readonly verdict?: 'allow_once' | 'deny' | 'answered' | 'expired' | 'cancelled' | null; readonly reason?: string | null }
 	| { readonly type: 'pinnedArchived'; readonly pinned: boolean; readonly archived: boolean }
-	| { readonly type: 'compaction'; readonly summary: string }
+	| { readonly type: 'compaction'; readonly summary: string; readonly messagesCompacted: number; readonly tokensBefore: number; readonly retainedTail: readonly string[]; readonly firstKeptEntryId?: string | null }
 	| { readonly type: 'compactionStarted'; readonly tokensBefore: number }
-	| { readonly type: 'metrics'; readonly kind: string; readonly data: unknown }
+	| { readonly type: 'metrics'; readonly kind: 'token_usage' | 'prefix_stability' | 'cache_invalidation' | 'side_call' | 'main_call'; readonly data: IManoxTokenUsageData | unknown }
 	| { readonly type: 'sessionInfo'; readonly data: unknown }
 	| { readonly type: 'leaf'; readonly targetId: string }
 	| { readonly type: 'goal'; readonly goal?: unknown }
 	| { readonly type: 'branchSummary'; readonly text: string }
 	| { readonly type: 'label'; readonly label: string }
-	| { readonly type: 'planReview'; readonly state: string; readonly planFile?: string | null }
-	| { readonly type: 'planUpdate'; readonly snapshot: unknown }
+	| { readonly type: 'planReview'; readonly state: 'proposed' | 'resolved'; readonly planFile?: string | null }
+	| { readonly type: 'planUpdate'; readonly snapshot: IManoxPlanSnapshot }
 	| { readonly type: 'browserSuites'; readonly suites: readonly string[] }
 	| { readonly type: 'backgroundTask'; readonly snapshot: unknown }
 	| { readonly type: 'activeToolsChange'; readonly tools: readonly string[] }
@@ -149,7 +263,8 @@ export interface IManoxSessionSnapshot {
 export type ManoxStreamFrame =
 	| ({ readonly type: 'snapshot' } & IManoxSessionSnapshot)
 	| { readonly type: 'entry'; readonly seq: number; readonly id: string; readonly parentId?: string | null; readonly timestamp: string; readonly event: ManoxJournalEvent }
-	| { readonly type: 'projections'; readonly sessionId: string; readonly asOfSeq: number; readonly values: Readonly<Record<string, unknown>> };
+	| { readonly type: 'projections'; readonly sessionId: string; readonly asOfSeq: number; readonly values: Readonly<Record<string, unknown>> }
+	| { readonly type: 'terminalOutput'; readonly data: string };
 
 export type ManoxFromServer =
 	| { readonly kind: 'response'; readonly id: string; readonly outcome: ManoxOutcome }
@@ -246,6 +361,81 @@ export class ManoxNapiTransport {
 	/** Open a follow stream (`FromClient::StreamOpen`). */
 	openStream(streamId: string, sessionId: string, maxMessages?: number): void {
 		this._sendJson({ kind: 'streamOpen', streamId, streamKind: { type: 'followSession', sessionId, maxMessages: maxMessages ?? null } });
+	}
+
+	// ---- Typed client calls (spec D.2) (see the casing traps in the header) ------------
+
+	/** Fork a session's active chain at an entry; answers `{session_id}`. */
+	forkSession(params: { sourceSessionId: string; throughEntryId: string; cwd?: string | null; project?: string | null; initialModel?: string | null; approvalMode?: string | null; reasoningEffort?: string | null }): Promise<{ session_id: string }> {
+		return this.call('forkSession', params as unknown as Record<string, unknown>) as Promise<{ session_id: string }>;
+	}
+
+	/** Steer the running turn (a no-turn steer degrades to a submit server-side,
+	 * so only send this while a turn is active); answers `{accepted, message_id}`. */
+	steer(params: { sessionId: string; messageId: string; text: string; images: readonly IManoxImageAttachment[] }): Promise<{ accepted: boolean; message_id?: string }> {
+		return this.call('steer', params as unknown as Record<string, unknown>) as Promise<{ accepted: boolean; message_id?: string }>;
+	}
+
+	/** Cold journal page-read (never activates the engine). */
+	pageHistory(params: { sessionId: string; throughSeq?: number; beforeSeq?: number | null; maxMessages?: number | null }): Promise<{ records: readonly ManoxJournalEntry[]; has_more: boolean; cursor: number }> {
+		return this.call('pageHistory', params as unknown as Record<string, unknown>) as Promise<{ records: readonly ManoxJournalEntry[]; has_more: boolean; cursor: number }>;
+	}
+
+	getConversationInfo(sessionId: string): Promise<IManoxConversationInfo> {
+		return this.call('getConversationInfo', { sessionId }) as Promise<IManoxConversationInfo>;
+	}
+
+	/** Bare snake_case array of session rows. */
+	listThreads(): Promise<readonly IManoxThreadListItem[]> {
+		return this.call('listThreads', {}) as Promise<readonly IManoxThreadListItem[]>;
+	}
+
+	listCommands(): Promise<readonly IManoxCommandInfo[]> {
+		return this.call('listCommands', {}) as Promise<readonly IManoxCommandInfo[]>;
+	}
+
+	/** Full-replace registration of one client's contributed tools. */
+	registerSessionTools(params: { sessionId: string; clientId: string; tools: readonly IManoxClientToolSpec[] }): Promise<{ registered: number }> {
+		return this.call('registerSessionTools', params as unknown as Record<string, unknown>) as Promise<{ registered: number }>;
+	}
+
+	/** Withdraw a pending adjudication delivery (user navigated away). */
+	cancelDelivery(deliveryId: string): Promise<unknown> {
+		return this.call('cancelDelivery', { deliveryId });
+	}
+
+	// ---- Typed notes --------------------------------------------------------
+
+	setApprovalMode(sessionId: string, mode: 'read-only' | 'workspace-write' | 'danger-full-access'): void {
+		this.sendNote({ method: 'setApprovalMode', sessionId, mode });
+	}
+
+	setReasoningEffort(sessionId: string, effort: 'high' | 'max'): void {
+		this.sendNote({ method: 'setReasoningEffort', sessionId, effort });
+	}
+
+	archiveThread(sessionId: string, archived: boolean): void {
+		this.sendNote({ method: 'archiveThread', sessionId, archived });
+	}
+
+	pinThread(sessionId: string, pinned: boolean): void {
+		this.sendNote({ method: 'pinThread', sessionId, pinned });
+	}
+
+	dropQueued(sessionId: string, clientId: string): void {
+		this.sendNote({ method: 'dropQueued', sessionId, clientId });
+	}
+
+	detachSession(sessionId: string): void {
+		this.sendNote({ method: 'detachSession', sessionId });
+	}
+
+	compact(sessionId: string, instructions: string | null): void {
+		this.sendNote({ method: 'compact', sessionId, instructions });
+	}
+
+	planSeedExecution(sessionId: string, planFile: string): void {
+		this.sendNote({ method: 'planSeedExecution', sessionId, planFile });
 	}
 
 	/** Answer a `FromServer::Request` server call. The reply payload rides the

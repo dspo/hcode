@@ -381,6 +381,15 @@ export const AgentHostManoxAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_MANOX_AGENT_E
  */
 export const AgentHostManoxHomeEnvVar = 'VSCODE_AGENT_HOST_MANOX_HOME';
 
+/**
+ * Approval mode manox sessions are created with (the manox permission
+ * vocabulary: `read-only` | `workspace-write` | `danger-full-access`).
+ * Defaults to `workspace-write`, so tool calls outside the granted-root
+ * fence surface as approval cards; set `danger-full-access` to run the
+ * experiment ungated. An invalid value falls back to the default.
+ */
+export const AgentHostManoxApprovalModeEnvVar = 'VSCODE_AGENT_HOST_MANOX_APPROVAL_MODE';
+
 // -- OpenTelemetry settings ------------------------------------------------------
 //
 // The `chat.agentHost.otel.*` namespace surfaces the same exporter knobs the CLI
