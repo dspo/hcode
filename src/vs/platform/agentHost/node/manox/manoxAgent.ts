@@ -14,10 +14,10 @@ import { AgentHostManoxApprovalModeEnvVar, AgentHostManoxHomeEnvVar, AgentHostMa
 import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
 import { createSchema, schemaProperty } from '../../common/agentHostSchema.js';
 import { getReasoningEffortDescription, getReasoningEffortLabel } from '../../common/reasoningEffort.js';
-import { resolveAgentChatContext, type AgentChatMigrationResult, type AgentProvider, type AgentSignal, type IActiveClient, type IAgent, type IAgentCapabilities, type IAgentChatConfigCompletionsParams, type IAgentChatContext, type IAgentChatMetadata, type IAgentChats, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentDescriptor, type IAgentDiscoveredChat, type IAgentHostCapabilities, type IAgentModelInfo, type IAgentResolveChatConfigParams } from '../../common/agent.js';
+import { AgentSession, resolveAgentChatContext, type AgentChatMigrationResult, type AgentProvider, type AgentSignal, type IActiveClient, type IAgent, type IAgentCapabilities, type IAgentChatConfigCompletionsParams, type IAgentChatContext, type IAgentChatDataChange, type IAgentChatMetadata, type IAgentChats, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentDescriptor, type IAgentDiscoveredChat, type IAgentHostCapabilities, type IAgentKnownSessionsFilter, type IAgentModelInfo, type IAgentResolveChatConfigParams } from '../../common/agent.js';
 import { ActionType, type SessionAction } from '../../common/state/sessionActions.js';
 import type { ChatAction } from '../../common/state/protocol/channels-chat/actions.js';
-import { ChatInputResponseKind, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolResultContentType, TurnState, createErrorResponsePart, parseChatUri, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, MessageAttachmentKind, ToolCallStatus, type ChatInputAnswer, type ChatInputOption, type ChatInputQuestion, type ChatInputRequest, type ClientPluginCustomization, type Customization, type Message, type MessageAttachment, type ModelSelection, type PendingMessage, type ResponsePart, type ToolCallPendingConfirmationState, type ToolDefinition, type Turn } from '../../common/state/sessionState.js';
+import { ChatInputResponseKind, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolResultContentType, TurnState, createErrorResponsePart, parseChatUri, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, MessageAttachmentKind, ToolCallStatus, type ChatInputAnswer, type ChatInputOption, type ChatInputQuestion, buildDefaultChatUri, type ChatInputRequest, type ClientPluginCustomization, type Customization, type Message, type MessageAttachment, type ModelSelection, type PendingMessage, type ResponsePart, type ToolCallPendingConfirmationState, type ToolDefinition, type Turn } from '../../common/state/sessionState.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import type { ConfigSchema, ProtectedResourceMetadata } from '../../common/state/protocol/state.js';
 import { ManoxNapiTransport, type IManoxImageAttachment, type ManoxFromServer, type ManoxJournalEntry, type ManoxJournalEvent } from './manoxNapiTransport.js';
@@ -124,8 +124,9 @@ const MANOX_SNAPSHOT_WINDOW = 200;
  */
 interface IManoxChatRecord {
 	readonly chatUri: URI;
-	readonly sessionId: string;
-	readonly streamId: string;
+	/** Rebinds on fork/truncate (the host learns the new id via onDidChangeChatData). */
+	sessionId: string;
+	streamId: string;
 	/** Journal records seen so far (snapshot + appended entries), seq order. */
 	readonly history: ManoxJournalEntry[];
 	/** Turn id the host passed to the most recent sendMessage. */
@@ -143,6 +144,10 @@ interface IManoxChatRecord {
 	turnStartedAt: number | undefined;
 	/** Live approval-mode mirror (journal permissionModeChange keeps it fresh). */
 	approvalMode: ManoxApprovalMode;
+	/** Session cwd from the follow snapshot (start-over truncation reuses it). */
+	cwd: string | undefined;
+	/** Last journal entry id observed inside a host-declared turn (fork point). */
+	readonly lastEntryIdByTurn: Map<string, string>;
 }
 
 export class ManoxAgent extends Disposable implements IAgent {
@@ -153,7 +158,8 @@ export class ManoxAgent extends Disposable implements IAgent {
 	private readonly _onDidChatProgress = this._register(new Emitter<AgentSignal>());
 	readonly onDidChatProgress = this._onDidChatProgress.event;
 	readonly onDidMaterializeChat = Event.None;
-	readonly onDidChangeChatData = Event.None;
+	private readonly _onDidChangeChatData = this._register(new Emitter<IAgentChatDataChange>());
+	readonly onDidChangeChatData = this._onDidChangeChatData.event;
 	readonly onDidSpawnChat = Event.None;
 	private readonly _onDidDiscoverChats = this._register(new Emitter<readonly IAgentDiscoveredChat[]>());
 	readonly onDidDiscoverChats = this._onDidDiscoverChats.event;
@@ -191,6 +197,9 @@ export class ManoxAgent extends Disposable implements IAgent {
 			// into the session's sandbox fence (dspo/manox#787); the primary
 			// cwd is fixed at creation.
 			multipleWorkingDirectories: { immutablePrimary: true },
+			// forkSession copies a session's active-chain prefix at an entry;
+			// the host normalizes side chats onto the same fork option.
+			multipleChats: { fork: true, sideChat: true },
 		};
 		return {
 			provider: this.id,
@@ -285,6 +294,9 @@ export class ManoxAgent extends Disposable implements IAgent {
 			case 'host':
 				if (event.host.type === 'models') {
 					void this._refreshModelsNow();
+				} else if (event.host.type === 'threadsUpdated') {
+					// Full-snapshot broadcast; coalesce bursts into one discovery pass.
+					this._scheduleDiscovery();
 				}
 				return;
 			case 'streamItem':
@@ -422,12 +434,16 @@ export class ManoxAgent extends Disposable implements IAgent {
 		if (frame.type === 'snapshot') {
 			record.history.length = 0;
 			record.history.push(...frame.records);
+			record.cwd = frame.header.cwd || record.cwd;
 			return;
 		}
 		if (frame.type !== 'entry') {
 			return;
 		}
 		record.history.push({ ...frame.event, seq: frame.seq, id: frame.id, parentId: frame.parentId, timestamp: frame.timestamp });
+		if (record.currentTurnId) {
+			record.lastEntryIdByTurn.set(record.currentTurnId, frame.id);
+		}
 		this._dispatchJournalEvent(record, frame.event);
 	}
 
@@ -607,17 +623,47 @@ export class ManoxAgent extends Disposable implements IAgent {
 			// exists for providers), so the mode is fixed per session.
 			const configuredMode = options?.config?.permissionMode;
 			const approvalMode: ManoxApprovalMode = isManoxApprovalMode(configuredMode) ? configuredMode : manoxDefaultApprovalMode();
-			const response = await transport.call('createSession', {
-				cwd: workingDirectory?.fsPath ?? null,
-				workingDirectories: extraWorkingDirectories,
-				project: null,
-				initialModel: options?.model?.id ?? null,
-				approvalMode,
-				reasoningEffort: null,
-			}) as { sessionId?: string; session_id?: string };
-			const sessionId = response?.sessionId ?? response?.session_id;
+			let sessionId: string | undefined;
+			if (options?.fork) {
+				// The host normalizes fork AND side chat onto this option; the
+				// forked turns are host-rendered either way, so a missing source
+				// or entry point degrades to a fresh session (claude's pattern)
+				// and only the backend continuation differs.
+				const sourceRecord = this._chats.get(options.fork.source.toString());
+				const throughEntryId = sourceRecord ? this._entryIdForTurn(sourceRecord, options.fork.turnId) : undefined;
+				if (sourceRecord && throughEntryId) {
+					try {
+						const forked = await transport.forkSession({
+							sourceSessionId: sourceRecord.sessionId,
+							throughEntryId,
+							cwd: workingDirectory?.fsPath ?? null,
+							initialModel: options?.model?.id ?? null,
+						});
+						sessionId = forked.session_id;
+						this._logService.info(`[manox] forked ${sourceRecord.sessionId}@${throughEntryId} -> ${sessionId}`);
+					} catch (err) {
+						this._logService.warn('[manox] forkSession failed; degrading to a fresh session', err);
+					}
+				} else {
+					this._logService.warn(`[manox] fork source or entry not resolvable (turn ${options.fork.turnId}); degrading to a fresh session`);
+				}
+			}
+			// importConversation deliberately lands here too: manox has no
+			// transcript-seeding API, so an import is a fresh backend with the
+			// imported turns rendered from the host's catalog (claude's model).
 			if (!sessionId) {
-				throw new Error(`[manox] createSession returned no session id: ${JSON.stringify(response)}`);
+				const response = await transport.call('createSession', {
+					cwd: workingDirectory?.fsPath ?? null,
+					workingDirectories: extraWorkingDirectories,
+					project: null,
+					initialModel: options?.model?.id ?? null,
+					approvalMode,
+					reasoningEffort: null,
+				}) as { sessionId?: string; session_id?: string };
+				sessionId = response?.sessionId ?? response?.session_id;
+			}
+			if (!sessionId) {
+				throw new Error('[manox] createSession returned no session id');
 			}
 			const record: IManoxChatRecord = {
 				chatUri: chat,
@@ -632,6 +678,8 @@ export class ManoxAgent extends Disposable implements IAgent {
 				turnActive: false,
 				turnStartedAt: undefined,
 				approvalMode,
+				cwd: workingDirectory?.fsPath,
+				lastEntryIdByTurn: new Map(),
 			};
 			this._chats.set(chat.toString(), record);
 			transport.openStream(record.streamId, record.sessionId, MANOX_SNAPSHOT_WINDOW);
@@ -759,6 +807,8 @@ export class ManoxAgent extends Disposable implements IAgent {
 			turnActive: false,
 			turnStartedAt: undefined,
 			approvalMode: manoxDefaultApprovalMode(),
+			cwd: undefined,
+			lastEntryIdByTurn: new Map(),
 		};
 		// Attach server-side (replays any parked adjudications to this owner);
 		// the answer is only `{restored: true}` — history arrives through the
@@ -889,6 +939,159 @@ export class ManoxAgent extends Disposable implements IAgent {
 	}
 
 	onClientToolCallComplete(): void { }
+
+	/** The journal entry a fork of `turnId` should cut through: the last
+	 * entry of that turn. Live turns are tracked as entries stream in; for
+	 * restored history the host's turn id IS the user-message entry id
+	 * (buildTurnsFromJournal), so the chain is walked forward to the next
+	 * user message. */
+	private _entryIdForTurn(record: IManoxChatRecord, turnId: string): string | undefined {
+		const live = record.lastEntryIdByTurn.get(turnId);
+		if (live) {
+			return live;
+		}
+		let inTurn = false;
+		let last: string | undefined;
+		for (const entry of record.history) {
+			if (entry.type === 'message' && entry.role === 'user') {
+				if (inTurn) {
+					return last;
+				}
+				inTurn = entry.id === turnId;
+				last = entry.id;
+			} else if (inTurn) {
+				last = entry.id;
+			}
+		}
+		return inTurn ? last : undefined;
+	}
+
+	/** Point an existing chat at a different backing session (fork-based
+	 * truncation): dispose the old session, reset the per-turn state, reopen
+	 * the follow stream (its snapshot rebuilds the retained history) and tell
+	 * the host to persist the new providerData. */
+	private async _rebindChatToSession(chat: URI, record: IManoxChatRecord, sessionId: string): Promise<void> {
+		this._transport?.sendNote({ method: 'disposeSession', sessionId: record.sessionId });
+		record.sessionId = sessionId;
+		record.streamId = generateUuid();
+		record.history.length = 0;
+		record.currentTurnId = undefined;
+		record.fallbackTurnId = undefined;
+		record.textPartId = undefined;
+		record.reasoningPartId = undefined;
+		record.startedToolCalls.clear();
+		record.turnActive = false;
+		record.turnStartedAt = undefined;
+		record.lastEntryIdByTurn.clear();
+		this._ensureConnected().openStream(record.streamId, sessionId, MANOX_SNAPSHOT_WINDOW);
+		this._onDidChangeChatData.fire({ chat, providerData: sessionId });
+	}
+
+	/** Checkpoint restore: fork the session at the retained turn (manox has
+	 * no in-place rewind; ForkSession's prefix copy IS the truncation) and
+	 * rebind, or mint a fresh session for a start-over. The host has already
+	 * truncated its UI state and dropped its checkpoints. */
+	async truncateChat(chat: URI, turnId: string | undefined, _context: URI | IAgentChatContext): Promise<void> {
+		const record = this._chats.get(chat.toString());
+		if (!record) {
+			return;
+		}
+		const transport = this._ensureConnected();
+		try {
+			if (turnId === undefined) {
+				const response = await transport.call('createSession', {
+					cwd: record.cwd ?? null,
+					workingDirectories: [],
+					project: null,
+					initialModel: null,
+					approvalMode: record.approvalMode,
+					reasoningEffort: null,
+				}) as { sessionId?: string; session_id?: string };
+				const fresh = response?.sessionId ?? response?.session_id;
+				if (fresh) {
+					await this._rebindChatToSession(chat, record, fresh);
+				}
+				return;
+			}
+			const throughEntryId = this._entryIdForTurn(record, turnId);
+			if (!throughEntryId) {
+				this._logService.warn(`[manox] truncate: no journal entry for turn '${turnId}'`);
+				return;
+			}
+			const forked = await transport.forkSession({ sourceSessionId: record.sessionId, throughEntryId });
+			await this._rebindChatToSession(chat, record, forked.session_id);
+		} catch (err) {
+			this._logService.warn('[manox] truncate failed', err);
+		}
+	}
+
+	// ---- Session discovery (external manox sessions) -------------------------
+
+	private _knownSessionsFilter: IAgentKnownSessionsFilter | undefined;
+	private _discoveryTimer: ReturnType<typeof setTimeout> | undefined;
+
+	setKnownSessionsFilter(filter: IAgentKnownSessionsFilter): void {
+		this._knownSessionsFilter = filter;
+	}
+
+	async startChatDiscovery(): Promise<void> {
+		await this._discoverExternalSessions();
+	}
+
+	private _scheduleDiscovery(): void {
+		if (this._discoveryTimer) {
+			clearTimeout(this._discoveryTimer);
+		}
+		this._discoveryTimer = setTimeout(() => {
+			this._discoveryTimer = undefined;
+			void this._discoverExternalSessions();
+		}, 2000);
+	}
+
+	/** Surface every top-level manox session (including ones created by the
+	 * desktop app under the same MANOX_HOME) as external discovered chats. */
+	private async _discoverExternalSessions(): Promise<void> {
+		try {
+			const threads = await this._ensureConnected().listThreads();
+			const sessionIds = threads.filter(thread => !thread.parent_id).map(thread => thread.id);
+			// One registry query drops already-registered candidates (the set
+			// holds session-URI strings, mirroring copilot's contract).
+			const known = this._knownSessionsFilter && sessionIds.length
+				? await this._knownSessionsFilter(sessionIds.map(id => AgentSession.uri(this.id, id)))
+				: undefined;
+			const candidates: IAgentDiscoveredChat[] = [];
+			for (const thread of threads) {
+				if (thread.parent_id) {
+					continue; // team member rows nest under their leader
+				}
+				if (known?.has(AgentSession.uri(this.id, thread.id).toString())) {
+					continue;
+				}
+				const chatUri = URI.parse(buildDefaultChatUri(AgentSession.uri(this.id, thread.id)));
+				candidates.push({
+					chat: chatUri,
+					startTime: thread.updated_at * 1000,
+					modifiedTime: thread.updated_at * 1000,
+					...(thread.title ? { summary: thread.title } : {}),
+					...(thread.project ? { workingDirectories: [URI.file(thread.project)] } : {}),
+					...(thread.model_id ? { model: { id: thread.model_id } } : {}),
+					external: true,
+				});
+			}
+			this._onDidDiscoverChats.fire(candidates);
+		} catch (err) {
+			this._logService.warn('[manox] session discovery failed', err);
+		}
+	}
+
+	/** Mirror the host's archive bit into the manox store so the desktop app
+	 * (and a later discovery pass) sees the same state. */
+	async onArchivedChanged(chat: URI, isArchived: boolean): Promise<void> {
+		const record = this._chats.get(chat.toString());
+		if (record) {
+			this._transport?.archiveThread(record.sessionId, isArchived);
+		}
+	}
 
 	/** Turn steering: forwarded as a wire steer only while a turn runs (a
 	 * no-turn steer degrades to a fresh submit server-side and would double-
