@@ -440,7 +440,7 @@ export class ManoxNapiTransport {
 
 	/** Answer a `FromServer::Request` server call. The reply payload rides the
 	 * same externally tagged `Ok`/`Err` encoding as responses. */
-	reply(id: string, payload: Record<string, unknown>): void {
+	reply(id: string, payload: Record<string, unknown> | null): void {
 		this._sendJson({ kind: 'reply', id, outcome: { Ok: payload } });
 	}
 

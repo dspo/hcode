@@ -4,6 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Emitter, Event } from '../../../../base/common/event.js';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { observableValue } from '../../../../base/common/observable.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -14,13 +16,13 @@ import { AgentHostManoxApprovalModeEnvVar, AgentHostManoxHomeEnvVar, AgentHostMa
 import { PendingRequestRegistry } from '../../common/pendingRequestRegistry.js';
 import { createSchema, schemaProperty } from '../../common/agentHostSchema.js';
 import { getReasoningEffortDescription, getReasoningEffortLabel } from '../../common/reasoningEffort.js';
-import { AgentSession, resolveAgentChatContext, type AgentChatMigrationResult, type AgentProvider, type AgentSignal, type IActiveClient, type IAgent, type IAgentCapabilities, type IAgentChatConfigCompletionsParams, type IAgentChatContext, type IAgentChatDataChange, type IAgentChatMetadata, type IAgentChats, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentDescriptor, type IAgentDiscoveredChat, type IAgentHostCapabilities, type IAgentKnownSessionsFilter, type IAgentModelInfo, type IAgentResolveChatConfigParams } from '../../common/agent.js';
+import { AgentSession, resolveAgentChatContext, type AgentChatMigrationResult, type AgentProvider, type AgentSignal, type IActiveClient, type IAgent, type IAgentCapabilities, type IAgentChatConfigCompletionsParams, type IAgentChatContext, type IAgentChatDataChange, type IAgentChatMetadata, type IAgentChats, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentDescriptor, type IAgentDiscoveredChat, type IAgentHostCapabilities, type IAgentKnownSessionsFilter, type IAgentModelInfo, type IAgentResolveChatConfigParams, type IAgentTurnTokenUsage } from '../../common/agent.js';
 import { ActionType, type SessionAction } from '../../common/state/sessionActions.js';
 import type { ChatAction } from '../../common/state/protocol/channels-chat/actions.js';
-import { ChatInputResponseKind, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolResultContentType, TurnState, createErrorResponsePart, parseChatUri, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, MessageAttachmentKind, ToolCallStatus, type ChatInputAnswer, type ChatInputOption, type ChatInputQuestion, buildDefaultChatUri, type ChatInputRequest, type ClientPluginCustomization, type Customization, type Message, type MessageAttachment, type ModelSelection, type PendingMessage, type ResponsePart, type ToolCallPendingConfirmationState, type ToolDefinition, type Turn } from '../../common/state/sessionState.js';
+import { ToolCallContributorKind, ChatInputResponseKind, MessageKind, ResponsePartKind, ToolCallConfirmationReason, ToolResultContentType, TurnState, createErrorResponsePart, parseChatUri, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, MessageAttachmentKind, ToolCallStatus, type ChatInputAnswer, type ChatInputOption, type ChatInputQuestion, buildDefaultChatUri, CustomizationType, type ChatInputRequest, type ClientPluginCustomization, type Customization, type Message, type PromptCustomization, type SkillCustomization, type MessageAttachment, type ModelSelection, type PendingMessage, type ResponsePart, type ToolCallResult, type ToolCallPendingConfirmationState, type ToolDefinition, type Turn } from '../../common/state/sessionState.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import type { ConfigSchema, ProtectedResourceMetadata } from '../../common/state/protocol/state.js';
-import { ManoxNapiTransport, type IManoxImageAttachment, type ManoxFromServer, type ManoxJournalEntry, type ManoxJournalEvent } from './manoxNapiTransport.js';
+import { ManoxNapiTransport, type IManoxClientToolSpec, type IManoxCommandInfo, type IManoxImageAttachment, type IManoxTokenUsageData, type ManoxFromServer, type ManoxJournalEntry, type ManoxJournalEvent } from './manoxNapiTransport.js';
 
 const MANOX_AGENT_PROVIDER_ID: AgentProvider = 'manox';
 
@@ -69,6 +71,37 @@ function manoxPermissionPath(input: unknown): string | undefined {
 		}
 	}
 	return undefined;
+}
+
+const execFileAsync = promisify(execFile);
+
+/** Read the system clipboard as UTF-8 text (manox accepts text/* only). */
+async function readSystemClipboardText(): Promise<string> {
+	const platform = process.platform;
+	const command = platform === 'darwin'
+		? { file: 'pbpaste', args: [] as string[] }
+		: platform === 'win32'
+			? { file: 'powershell.exe', args: ['-NoProfile', '-Command', 'Get-Clipboard'] }
+			: { file: 'xclip', args: ['-o', '-selection', 'clipboard'] };
+	const { stdout } = await execFileAsync(command.file, command.args, { timeout: 3000 });
+	return stdout;
+}
+
+/** Schemes the external opener accepts (the agent-host process has no
+ * renderer-side trusted-link prompt, so the scheme list IS the guard). */
+const MANOX_OPENABLE_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'file:']);
+
+async function openExternalUrl(url: string): Promise<void> {
+	const parsed = URI.parse(url);
+	if (!MANOX_OPENABLE_SCHEMES.has(parsed.scheme)) {
+		throw new Error(`refusing to open URL with scheme '${parsed.scheme}'`);
+	}
+	const command = process.platform === 'darwin'
+		? { file: 'open', args: [url] }
+		: process.platform === 'win32'
+			? { file: 'cmd.exe', args: ['/c', 'start', '', url] }
+			: { file: 'xdg-open', args: [url] };
+	await execFileAsync(command.file, command.args, { timeout: 5000 });
 }
 
 /** Reasoning-effort key in `ModelSelection.config` — the shared picker
@@ -148,6 +181,31 @@ interface IManoxChatRecord {
 	cwd: string | undefined;
 	/** Last journal entry id observed inside a host-declared turn (fork point). */
 	readonly lastEntryIdByTurn: Map<string, string>;
+	/** Accumulated token usage per host turn id (journal token_usage metrics). */
+	readonly turnTokenUsage: Map<string, { input: number; output: number; cacheRead: number; records: number }>;
+}
+
+/** One active client's contribution handle; assigning `tools` pushes the
+ * set into the session (wire registration is full-replace). */
+class ManoxActiveClient implements IActiveClient {
+	private _tools: readonly ToolDefinition[] = [];
+	private _customizations: readonly ClientPluginCustomization[] = [];
+
+	constructor(
+		private readonly _agent: ManoxAgent,
+		private readonly _chat: URI,
+		readonly clientId: string,
+		readonly displayName: string | undefined,
+	) { }
+
+	get tools(): readonly ToolDefinition[] { return this._tools; }
+	set tools(value: readonly ToolDefinition[]) {
+		this._tools = value;
+		this._agent._syncClientTools(this._chat, this.clientId, value);
+	}
+
+	get customizations(): readonly ClientPluginCustomization[] { return this._customizations; }
+	set customizations(value: readonly ClientPluginCustomization[]) { this._customizations = value; }
 }
 
 export class ManoxAgent extends Disposable implements IAgent {
@@ -173,6 +231,11 @@ export class ManoxAgent extends Disposable implements IAgent {
 	private readonly _pendingPermissions = new PendingRequestRegistry<boolean, { readonly replyId: string; readonly chat: URI }>();
 	/** Parked askUserQuestion solicitations. */
 	private readonly _pendingUserInputs = new PendingRequestRegistry<{ readonly response: ChatInputResponseKind; readonly answers?: Record<string, ChatInputAnswer> }, { readonly replyId: string }>();
+	/** Parked invokeClientTool round-trips; the host executes the tool. */
+	private readonly _pendingClientTools = new PendingRequestRegistry<{ readonly content: string; readonly isError: boolean }, { readonly replyId: string }>();
+	/** Last-known slash-command catalog (listCommands + host commands events). */
+	private _commands: readonly IManoxCommandInfo[] = [];
+	private readonly _onDidCustomizationsChange = this._register(new Emitter<void>());
 	/** Active-client handles keyed by `chat::clientId` (stable across fan-outs). */
 	private readonly _activeClients = new Map<string, IActiveClient>();
 
@@ -297,6 +360,9 @@ export class ManoxAgent extends Disposable implements IAgent {
 				} else if (event.host.type === 'threadsUpdated') {
 					// Full-snapshot broadcast; coalesce bursts into one discovery pass.
 					this._scheduleDiscovery();
+				} else if (event.host.type === 'commands') {
+					this._commands = event.host.commands;
+					this._onDidCustomizationsChange.fire();
 				}
 				return;
 			case 'streamItem':
@@ -408,11 +474,110 @@ export class ManoxAgent extends Disposable implements IAgent {
 					});
 				return;
 			}
+			case 'planVerdict': {
+				// The plan-review verdict as a single-select question; a
+				// decline/cancel maps to `refine` (clears the pending card,
+				// keeps the conversation going) — an Err would cancel the
+				// hanging turn outright.
+				const record = call.sessionId ? this._recordForSession(call.sessionId) : undefined;
+				if (!record) {
+					transport.replyError(event.id, 'unknown session');
+					return;
+				}
+				const request: ChatInputRequest = {
+					id: event.id,
+					message: call.title ?? call.planFile ?? localize('manoxAgent.planReview', "Plan review"),
+					questions: [{
+						kind: ChatInputQuestionKind.SingleSelect,
+						id: 'verdict',
+						title: localize('manoxAgent.planVerdict', "Plan approval"),
+						message: call.content ?? localize('manoxAgent.planVerdictMissing', "The plan file could not be read; review it before approving."),
+						options: [
+							{ id: 'execute_keep', label: localize('manoxAgent.planVerdict.executeKeep', "Execute"), description: localize('manoxAgent.planVerdict.executeKeepDescription', "Run the plan and keep it in the transcript.") },
+							{ id: 'execute_compact', label: localize('manoxAgent.planVerdict.executeCompact', "Execute (compact)"), description: localize('manoxAgent.planVerdict.executeCompactDescription', "Run the plan and compact it afterwards.") },
+							{ id: 'refine', label: localize('manoxAgent.planVerdict.refine', "Refine"), description: localize('manoxAgent.planVerdict.refineDescription', "Keep discussing the plan without executing it.") },
+						],
+					}],
+				};
+				void this._pendingUserInputs
+					.registerAndFire(event.id, () => {
+						this._fire(record, { type: ActionType.ChatInputRequested, request });
+					}, { replyId: event.id })
+					.then(result => {
+						let choice: 'execute_keep' | 'execute_compact' | 'refine' = 'refine';
+						const answer = result.answers?.verdict;
+						const value = answer && answer.state !== ChatInputAnswerState.Skipped && answer.value.kind === ChatInputAnswerValueKind.Selected
+							? answer.value.value : undefined;
+						if (result.response === ChatInputResponseKind.Accept && (value === 'execute_keep' || value === 'execute_compact' || value === 'refine')) {
+							choice = value;
+						}
+						transport.reply(event.id, { choice });
+					});
+				return;
+			}
+			case 'invokeClientTool': {
+				// The model called a tool the host registered through
+				// registerSessionTools: surface the call on the chat (the host
+				// executes it in its own window) and park until
+				// onClientToolCallComplete resolves the round-trip.
+				const record = call.sessionId ? this._recordForSession(call.sessionId) : undefined;
+				if (!record) {
+					transport.replyError(event.id, 'unknown session');
+					return;
+				}
+				const toolCallId = call.toolCallId ?? event.id;
+				const toolName = call.name ?? 'client tool';
+				record.startedToolCalls.add(toolCallId);
+				const turnId = this._turnId(record);
+				this._fire(record, {
+					type: ActionType.ChatToolCallStart,
+					turnId,
+					toolCallId,
+					toolName,
+					displayName: toolName,
+					...(call.clientId !== undefined ? { contributor: { kind: ToolCallContributorKind.Client, clientId: call.clientId } } : {}),
+				});
+				this._fire(record, {
+					type: ActionType.ChatToolCallReady,
+					turnId,
+					toolCallId,
+					invocationMessage: toolName,
+					toolInput: call.input === undefined ? undefined : JSON.stringify(call.input, undefined, 2),
+					confirmed: ToolCallConfirmationReason.NotNeeded,
+				});
+				void this._pendingClientTools
+					.register(toolCallId, { replyId: event.id })
+					.then(result => transport.reply(event.id, { content: result.content, isError: result.isError }))
+					.catch(() => transport.replyError(event.id, 'client tool call cancelled'));
+				return;
+			}
+			case 'clipboardRead': {
+				// manox accepts text/* only; empty clipboard answers null and
+				// any failure is an Err (the model sees a failed read).
+				void readSystemClipboardText()
+					.then(text => transport.reply(event.id, text ? { data: Buffer.from(text, 'utf8').toString('base64'), mimeType: 'text/plain' } : null))
+					.catch(err => {
+						this._logService.warn('[manox] clipboard read failed', err);
+						transport.replyError(event.id, `clipboard unavailable: ${err instanceof Error ? err.message : String(err)}`);
+					});
+				return;
+			}
+			case 'openExternal': {
+				const url = call.url ?? '';
+				void openExternalUrl(url)
+					.then(() => {
+						this._logService.info(`[manox] opened external URL ${url}`);
+						transport.reply(event.id, {});
+					})
+					.catch(err => {
+						this._logService.warn(`[manox] refused/failed to open ${url}`, err);
+						transport.replyError(event.id, err instanceof Error ? err.message : String(err));
+					});
+				return;
+			}
 			default:
-				// Fail closed rather than stalling the server's 300s timeout:
-				// browserOp is undeclared (never routed); clipboardRead /
-				// openExternal / invokeClientTool / planVerdict arrive once the
-				// corresponding bridge lands.
+				// browserOp is undeclared in the napi handshake (no browser
+				// surface in VS Code), so it is never routed here.
 				this._logService.warn(`[manox] unhandled server call '${call.method}'; denying`);
 				transport.replyError(event.id, 'not supported by the manox agent host');
 		}
@@ -602,7 +767,44 @@ export class ManoxAgent extends Disposable implements IAgent {
 				// Journal mirror of the adjudication the approve server call
 				// already drove; the card's lifecycle is host-owned.
 				return;
+			case 'metrics':
+				if (event.kind !== 'token_usage' || !record.currentTurnId) {
+					return;
+				}
+				this._accumulateTokenUsage(record, record.currentTurnId, event.data as IManoxTokenUsageData);
+				return;
 		}
+	}
+
+	private _accumulateTokenUsage(record: IManoxChatRecord, turnId: string, data: IManoxTokenUsageData): void {
+		const totals = record.turnTokenUsage.get(turnId) ?? { input: 0, output: 0, cacheRead: 0, records: 0 };
+		totals.input += data.input_tokens ?? 0;
+		totals.output += data.output_tokens ?? 0;
+		totals.cacheRead += (data.cache_read_input_tokens ?? 0) + (data.cache_creation_input_tokens ?? 0);
+		totals.records += 1;
+		record.turnTokenUsage.set(turnId, totals);
+	}
+
+	/** Token usage per turn from the journal's token_usage metrics —
+	 * sufficient for the usage display and the turn tracker's accounting. */
+	getTurnTokenUsage(chat: URI, turnId: string, _parentToolCallId?: string): IAgentTurnTokenUsage | undefined {
+		const totals = this._chats.get(chat.toString())?.turnTokenUsage.get(turnId);
+		if (!totals || totals.records === 0) {
+			return undefined;
+		}
+		return {
+			summaries: [{
+				usageScope: 'direct-model',
+				usageStatus: 'known',
+				usageRecordCount: totals.records,
+				inputKnownRecordCount: totals.records,
+				outputKnownRecordCount: totals.records,
+				cacheKnownRecordCount: totals.records,
+				knownInputTokens: totals.input,
+				knownOutputTokens: totals.output,
+				knownCacheReadTokens: totals.cacheRead,
+			}],
+		};
 	}
 
 	// ---- IAgentChats ----------------------------------------------------------
@@ -680,6 +882,7 @@ export class ManoxAgent extends Disposable implements IAgent {
 				approvalMode,
 				cwd: workingDirectory?.fsPath,
 				lastEntryIdByTurn: new Map(),
+				turnTokenUsage: new Map(),
 			};
 			this._chats.set(chat.toString(), record);
 			transport.openStream(record.streamId, record.sessionId, MANOX_SNAPSHOT_WINDOW);
@@ -745,6 +948,9 @@ export class ManoxAgent extends Disposable implements IAgent {
 			record.fallbackTurnId = undefined;
 			record.textPartId = undefined;
 			record.reasoningPartId = undefined;
+			if (turnId !== undefined) {
+				record.turnTokenUsage.delete(turnId);
+			}
 			const receipt = await this._call('submit', {
 				sessionId: record.sessionId,
 				text: referenceTexts.length ? `${prompt}\n\n${referenceTexts.join('\n')}` : prompt,
@@ -809,6 +1015,7 @@ export class ManoxAgent extends Disposable implements IAgent {
 			approvalMode: manoxDefaultApprovalMode(),
 			cwd: undefined,
 			lastEntryIdByTurn: new Map(),
+			turnTokenUsage: new Map(),
 		};
 		// Attach server-side (replays any parked adjudications to this owner);
 		// the answer is only `{restored: true}` — history arrives through the
@@ -860,8 +1067,56 @@ export class ManoxAgent extends Disposable implements IAgent {
 		return { items: [] };
 	}
 
-	async getChatCustomizations(): Promise<readonly Customization[]> {
-		return [];
+	readonly onDidCustomizationsChange = this._onDidCustomizationsChange.event;
+
+	/** manox's slash-command catalog as per-session customizations: skills
+	 * and commands surface as the children of two synthetic read-only
+	 * directory containers (skills in the skill picker, commands as
+	 * prompts). */
+	async getChatCustomizations(_chat: URI): Promise<readonly Customization[]> {
+		if (!this._commands.length) {
+			try {
+				this._commands = await this._ensureConnected().listCommands();
+			} catch (err) {
+				this._logService.warn('[manox] listCommands failed', err);
+				return [];
+			}
+		}
+		const toChild = (command: IManoxCommandInfo): SkillCustomization | PromptCustomization => ({
+			type: command.kind === 'skill' ? CustomizationType.Skill : CustomizationType.Prompt,
+			id: `manox:${command.kind}:${command.name}`,
+			uri: `manox://commands/${encodeURIComponent(command.name)}`,
+			name: command.name,
+			...(command.description ? { description: command.description } : {}),
+		});
+		const skills = this._commands.filter(command => command.kind === 'skill');
+		const prompts = this._commands.filter(command => command.kind === 'command');
+		const containers: Customization[] = [];
+		if (skills.length) {
+			containers.push({
+				type: CustomizationType.Directory,
+				id: 'manox:skills',
+				uri: 'manox://commands',
+				name: localize('manoxAgent.skillsContainer', "Manox Skills"),
+				enabled: true,
+				contents: CustomizationType.Skill,
+				writable: false,
+				children: skills.map(toChild),
+			});
+		}
+		if (prompts.length) {
+			containers.push({
+				type: CustomizationType.Directory,
+				id: 'manox:prompts',
+				uri: 'manox://commands',
+				name: localize('manoxAgent.promptsContainer', "Manox Commands"),
+				enabled: true,
+				contents: CustomizationType.Prompt,
+				writable: false,
+				children: prompts.map(toChild),
+			});
+		}
+		return containers;
 	}
 
 	async setWorkingDirectory(_chat: URI, _context: URI | IAgentChatContext, _workingDirectory: URI): Promise<void> {
@@ -919,16 +1174,7 @@ export class ManoxAgent extends Disposable implements IAgent {
 		const key = `${chat.toString()}::${client.clientId}`;
 		let handle = this._activeClients.get(key);
 		if (!handle) {
-			let tools: readonly ToolDefinition[] = [];
-			let customizations: readonly ClientPluginCustomization[] = [];
-			handle = {
-				clientId: client.clientId,
-				displayName: client.displayName,
-				get tools() { return tools; },
-				set tools(value: readonly ToolDefinition[]) { tools = value; },
-				get customizations() { return customizations; },
-				set customizations(value: readonly ClientPluginCustomization[]) { customizations = value; },
-			};
+			handle = new ManoxActiveClient(this, chat, client.clientId, client.displayName);
 			this._activeClients.set(key, handle);
 		}
 		return handle;
@@ -936,9 +1182,42 @@ export class ManoxAgent extends Disposable implements IAgent {
 
 	removeActiveClient(chat: URI, _context: URI | IAgentChatContext, clientId: string): void {
 		this._activeClients.delete(`${chat.toString()}::${clientId}`);
+		// Full-replace semantics on the wire: an empty registration retires
+		// the client's tools server-side.
+		const record = this._chats.get(chat.toString());
+		if (record && this._transport) {
+			void this._transport.registerSessionTools({ sessionId: record.sessionId, clientId, tools: [] }).catch(err => this._logService.warn('[manox] client-tool deregistration failed', err));
+		}
 	}
 
-	onClientToolCallComplete(): void { }
+	onClientToolCallComplete(_chat: URI, toolCallId: string, result: ToolCallResult): void {
+		const parts: string[] = [];
+		for (const content of result.content ?? []) {
+			if (content.type === ToolResultContentType.Text) {
+				parts.push(content.text);
+			}
+		}
+		this._pendingClientTools.respond(toolCallId, {
+			content: parts.join('\n') || 'ok',
+			isError: !result.success,
+		});
+	}
+
+	/** Push one client's contributed tools into the session (full replace). */
+	public _syncClientTools(chat: URI, clientId: string, tools: readonly ToolDefinition[]): void {
+		const record = this._chats.get(chat.toString());
+		if (!record || !this._transport) {
+			return;
+		}
+		const specs: IManoxClientToolSpec[] = tools.map(tool => ({
+			name: tool.name,
+			description: tool.description ?? tool.title ?? tool.name,
+			input_schema: tool.inputSchema ?? { type: 'object' },
+		}));
+		void this._transport.registerSessionTools({ sessionId: record.sessionId, clientId, tools: specs })
+			.then(({ registered }) => this._logService.info(`[manox] registered ${registered} client tools for ${clientId}`))
+			.catch(err => this._logService.warn('[manox] client-tool registration failed', err));
+	}
 
 	/** The journal entry a fork of `turnId` should cut through: the last
 	 * entry of that turn. Live turns are tracked as entries stream in; for
