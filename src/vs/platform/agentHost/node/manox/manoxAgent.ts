@@ -85,7 +85,12 @@ export class ManoxAgent extends Disposable implements IAgent {
 	}
 
 	getDescriptor(): IAgentDescriptor {
-		const capabilities: IAgentCapabilities = {};
+		const capabilities: IAgentCapabilities = {
+			// The manox kernel grants every createSession working directory
+			// into the session's sandbox fence (dspo/manox#787); the primary
+			// cwd is fixed at creation.
+			multipleWorkingDirectories: { immutablePrimary: true },
+		};
 		return {
 			provider: this.id,
 			displayName: localize('manoxAgent.displayName', "Manox"),
@@ -371,8 +376,14 @@ export class ManoxAgent extends Disposable implements IAgent {
 			resolveAgentChatContext(context, chat);
 			const transport = this._ensureConnected();
 			const workingDirectory = options?.workingDirectories?.[0];
+			// Multi-root: the primary directory is the session cwd; every
+			// additional folder rides `workingDirectories` and joins the
+			// kernel's granted-root fence (dspo/manox#787), persisted in the
+			// session sidecar so restores replay it.
+			const extraWorkingDirectories = options?.workingDirectories?.slice(1).map(uri => uri.fsPath) ?? [];
 			const response = await transport.call('createSession', {
 				cwd: workingDirectory?.fsPath ?? null,
+				workingDirectories: extraWorkingDirectories,
 				project: null,
 				initialModel: options?.model?.id ?? null,
 				approvalMode: MANOX_APPROVAL_MODE,
