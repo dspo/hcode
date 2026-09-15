@@ -1,6 +1,6 @@
 {
-	"nameShort": "Code H",
-	"nameLong": "Visual Studio Code H",
+	"nameShort": "hcode",
+	"nameLong": "hcode",
 	"applicationName": "hcode",
 	"dataFolderName": ".hcode",
 	"sharedDataFolderName": ".vscode-oss-shared",

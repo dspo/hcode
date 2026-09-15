@@ -233,10 +233,10 @@ export class ManoxAgent extends Disposable implements IAgent {
 		if (this._transport) {
 			return this._transport;
 		}
-		const sdkRoot = process.env[AgentHostManoxSdkRootEnvVar];
-		if (!sdkRoot) {
-			throw new Error(`${AgentHostManoxSdkRootEnvVar} is not set`);
-		}
+		// Packaged launches carry no env vars: default to the addon's build
+		// location (manox repo `script/build-napi`).
+		const sdkRoot = process.env[AgentHostManoxSdkRootEnvVar]
+			?? `${process.env['HOME'] ?? ''}/worktrees/manox/vscode-integ/target/napi`;
 		// Redirect the manox state root (runtime lock, threads.db, provider
 		// config) so the harness never contends with a running manox app or a
 		// stale extension host holding the default `~/.manox` lock.
