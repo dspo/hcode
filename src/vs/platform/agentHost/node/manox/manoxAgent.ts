@@ -268,6 +268,8 @@ export class ManoxAgent extends Disposable implements IAgent {
 		}
 	}
 
+	private _modelRefreshRetries = 0;
+
 	private async _refreshModelsNow(): Promise<void> {
 		try {
 			const raw = await this._call('listModels');
@@ -276,6 +278,17 @@ export class ManoxAgent extends Disposable implements IAgent {
 				this._logService.warn('[manox] listModels returned an unexpected shape');
 				return;
 			}
+			// Provider registration runs on a background thread in the runtime
+			// (~seconds with keychain/shell apikey sources), and the initial
+			// registration emits no models host event — a listModels racing it
+			// returns an empty catalog that would otherwise sit until the next
+			// scheduled refresh. Retry with backoff until the catalog lands.
+			if (models.length === 0 && this._modelRefreshRetries < 10) {
+				this._modelRefreshRetries++;
+				setTimeout(() => void this._refreshModelsNow(), 1000 * this._modelRefreshRetries);
+				return;
+			}
+			this._modelRefreshRetries = 0;
 			this._models.set(models.map((m: {
 				id?: unknown; name?: unknown; provider?: unknown; api?: unknown;
 				contextWindow?: unknown; context_window?: unknown;
