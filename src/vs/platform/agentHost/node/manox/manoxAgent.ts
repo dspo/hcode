@@ -1309,9 +1309,21 @@ export class ManoxAgent extends Disposable implements IAgent {
 
 	/** Surface every top-level manox session (including ones created by the
 	 * desktop app under the same MANOX_HOME) as external discovered chats. */
+	private _discoveryRetries = 0;
+
 	private async _discoverExternalSessions(): Promise<void> {
 		try {
 			const threads = await this._ensureConnected().listThreads();
+			// The store's initial scan is asynchronous: listThreads answers
+			// empty until it lands, and no threadsUpdated event follows the
+			// scan itself — a one-shot discovery would miss every session.
+			// Retry with backoff until rows appear (or the budget ends).
+			if (threads.length === 0 && this._discoveryRetries < 8) {
+				this._discoveryRetries++;
+				setTimeout(() => void this._discoverExternalSessions(), 1000 * this._discoveryRetries);
+				return;
+			}
+			this._discoveryRetries = 0;
 			const sessionIds = threads.filter(thread => !thread.parent_id).map(thread => thread.id);
 			// One registry query drops already-registered candidates (the set
 			// holds session-URI strings, mirroring copilot's contract).
