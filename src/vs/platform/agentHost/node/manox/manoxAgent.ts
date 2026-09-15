@@ -1109,9 +1109,10 @@ export class ManoxAgent extends Disposable implements IAgent {
 	async getChatMetadata(chat: URI): Promise<IAgentChatMetadata | undefined> {
 		const record = this._chats.get(chat.toString());
 		if (!record) {
-			// No live backing: let the host fall back to its registry values
-			// instead of fabricating timestamps that advance on every call.
-			return undefined;
+			// Not materialized yet (window restore of a known/durably
+			// discovered session): describe it from the thread catalog so
+			// subscribe/restore can proceed; opening happens on materialize.
+			return this._describeExternalSession(chat);
 		}
 		const first = record.history[0];
 		const last = record.history[record.history.length - 1];
@@ -1339,6 +1340,34 @@ export class ManoxAgent extends Disposable implements IAgent {
 			this._onDidDiscoverChats.fire(candidates);
 		} catch (err) {
 			this._logService.warn('[manox] session discovery failed', err);
+		}
+	}
+
+	/** Resolve metadata for a session the harness has not loaded yet
+	 * (external or pre-restore) from the thread catalog. */
+	private async _describeExternalSession(chat: URI): Promise<IAgentChatMetadata | undefined> {
+		const id = AgentSession.id(chat);
+		if (!id) {
+			return undefined;
+		}
+		try {
+			const threads = await this._ensureConnected().listThreads();
+			const thread = threads.find(candidate => candidate.id === id);
+			if (!thread) {
+				return undefined;
+			}
+			const modifiedTime = thread.updated_at * 1000;
+			return {
+				chat,
+				startTime: modifiedTime,
+				modifiedTime,
+				...(thread.title ? { summary: thread.title } : {}),
+				...(thread.project ? { workingDirectories: [URI.file(thread.project)] } : {}),
+				...(thread.model_id ? { model: { id: thread.model_id } } : {}),
+			};
+		} catch (err) {
+			this._logService.warn('[manox] describing an unloaded session failed', err);
+			return undefined;
 		}
 	}
 
