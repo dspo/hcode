@@ -195,14 +195,12 @@ async function startAgentHost(): Promise<void> {
 			registerCodexIfEnabled();
 			disposables.add(agentConfigurationService.onDidRootConfigChange(registerCodexIfEnabled));
 		}
-		// Experimental Manox harness: opt-in via env vars, requires the locally
-		// built manox napi addon (manox repo `script/build-napi`). There is no
-		// setting surface yet — enable with
-		// VSCODE_AGENT_HOST_MANOX_AGENT_ENABLED=true plus
-		// VSCODE_AGENT_HOST_MANOX_SDK_ROOT (and, recommended,
-		// VSCODE_AGENT_HOST_MANOX_HOME to isolate the manox state root).
-		if (isAgentEnabled(process.env[AgentHostManoxAgentEnabledEnvVar], false)) {
-			const manoxSdkRoot = process.env[AgentHostManoxSdkRootEnvVar];
+		// Manox harness: the fork's default (and only) harness. Enabled
+		// unless explicitly disabled so packaged Finder launches work without
+		// env vars; the addon resolves from VSCODE_AGENT_HOST_MANOX_SDK_ROOT or
+		// the default build location below (manox repo `script/build-napi`).
+		if (isAgentEnabled(process.env[AgentHostManoxAgentEnabledEnvVar], true)) {
+			const manoxSdkRoot = process.env[AgentHostManoxSdkRootEnvVar] ?? `${process.env['HOME'] ?? ''}/worktrees/manox/vscode-integ/target/napi`;
 			if (isManoxAddonAvailable(manoxSdkRoot)) {
 				providerService.registerProvider(instantiationService.createInstance(ManoxAgent));
 			} else {

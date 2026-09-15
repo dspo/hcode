@@ -199,8 +199,8 @@ export class ManoxAgent extends Disposable implements IAgent {
 	) {
 		super();
 		// Eager connect so the model catalog is available to the new-session
-		// picker. With VSCODE_AGENT_HOST_MANOX_HOME set this cannot contend for
-		// the manox runtime lock; a failure leaves the harness unconnected and
+		// picker. Concurrency with a running manox app is fine (per-resource
+		// locks, dspo/manox#794); a failure leaves the harness unconnected and
 		// createChat retries lazily.
 		try {
 			this._ensureConnected();
@@ -240,10 +240,13 @@ export class ManoxAgent extends Disposable implements IAgent {
 		// Redirect the manox state root (runtime lock, threads.db, provider
 		// config) so the harness never contends with a running manox app or a
 		// stale extension host holding the default `~/.manox` lock.
-		const manoxHome = process.env[AgentHostManoxHomeEnvVar];
-		if (manoxHome) {
-			process.env.MANOX_HOME = manoxHome;
-		}
+		// Packaged (Finder) launches carry no env vars. manox replaced its
+		// global runtime.lock with resource-granular locks (dspo/manox#794),
+		// so multi-instance over one state root is the supported shape: the
+		// default home is the desktop app's `~/.manox`, making sessions
+		// cross-visible between the app and this harness. Set
+		// VSCODE_AGENT_HOST_MANOX_HOME to isolate again.
+		process.env.MANOX_HOME = process.env[AgentHostManoxHomeEnvVar] ?? `${process.env['HOME'] ?? ''}/.manox`;
 		this._transport = ManoxNapiTransport.load(
 			sdkRoot,
 			event => this._handleEvent(event),

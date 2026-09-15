@@ -26,6 +26,12 @@ import { createRequire } from 'node:module';
  * `metrics` token-usage data is snake_case bare serde. Only
  * `getConversationInfo` and the assistant-message `usage` payload are
  * hand-written camelCase.
+ *
+ * Stable error codes in `Err.data.code`: session/not-found,
+ * session/already-owned (another process holds this session's write lease —
+ * e.g. the manox desktop app has the session open; retry or open it there),
+ * gateway/bad-request, gateway/internal, resync-required, model/unresolvable,
+ * feature/unavailable, protocol/unsupported-epoch, client/reseated.
  */
 
 /** Loaded from `VSCODE_AGENT_HOST_MANOX_SDK_ROOT` (dir or .node file path). */
