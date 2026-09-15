@@ -23,7 +23,7 @@ import { ToolCallContributorKind, ChatInputResponseKind, ResponsePartKind, ToolC
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import type { ConfigSchema, ProtectedResourceMetadata } from '../../common/state/protocol/state.js';
 import { buildTurnsFromJournal, manoxAnswerText, manoxPermissionKind, manoxPermissionPath } from './manoxMapping.js';
-import { ManoxNapiTransport, type IManoxClientToolSpec, type IManoxCommandInfo, type IManoxImageAttachment, type IManoxTokenUsageData, type ManoxFromServer, type ManoxJournalEntry, type ManoxJournalEvent } from './manoxNapiTransport.js';
+import { ManoxNapiTransport, type IManoxClientToolSpec, type IManoxCommandInfo, type IManoxImageAttachment, type IManoxPlanSnapshot, type IManoxTokenUsageData, type ManoxFromServer, type ManoxJournalEntry, type ManoxJournalEvent } from './manoxNapiTransport.js';
 
 const MANOX_AGENT_PROVIDER_ID: AgentProvider = 'manox';
 
@@ -110,6 +110,17 @@ const MANOX_SNAPSHOT_WINDOW = 200;
  * providerData token; the manox session id lives only here and, durably, in
  * the providerData blob the orchestrator persists for restore.
  */
+/** manox wire `backgroundTask` snapshot (TaskSnapshot, snake-free camel on wire). */
+interface IManoxTaskSnapshot {
+	readonly task_id: string;
+	readonly kind: string;
+	readonly description: string;
+	readonly status: 'Running' | 'Completed' | 'Failed' | 'TimedOut' | 'Stopped' | 'Stopping' | 'SessionEnded';
+	readonly exit_code?: number | null;
+	readonly failure_summary?: string | null;
+	readonly output_tail?: string;
+}
+
 interface IManoxChatRecord {
 	readonly chatUri: URI;
 	/** Rebinds on fork/truncate (the host learns the new id via onDidChangeChatData). */
@@ -138,6 +149,16 @@ interface IManoxChatRecord {
 	readonly lastEntryIdByTurn: Map<string, string>;
 	/** Accumulated token usage per host turn id (journal token_usage metrics). */
 	readonly turnTokenUsage: Map<string, { input: number; output: number; cacheRead: number; records: number }>;
+	/** Accumulated live output per tool call (toolOutputChunk stream); the
+	 * host's content-changed action replaces content wholesale, so the
+	 * harness owns the accumulation. */
+	readonly toolOutputs: Map<string, string>;
+	/** Plan mode mirror (journal planModeChange keeps it fresh). */
+	planMode: boolean;
+	/** Counter for emitted plan markdown parts. */
+	planPartCounter: number;
+	/** Background-task sentinel cards already started (task id keyed). */
+	readonly backgroundStarted: Set<string>;
 }
 
 /** One active client's contribution handle; assigning `tools` pushes the
@@ -638,6 +659,7 @@ export class ManoxAgent extends Disposable implements IAgent {
 		record.textPartId = undefined;
 		record.reasoningPartId = undefined;
 		record.startedToolCalls.clear();
+		record.toolOutputs.clear();
 	}
 
 	private _dispatchJournalEvent(record: IManoxChatRecord, event: ManoxJournalEvent): void {
@@ -752,6 +774,18 @@ export class ManoxAgent extends Disposable implements IAgent {
 				}
 				this._accumulateTokenUsage(record, record.currentTurnId, event.data as IManoxTokenUsageData);
 				return;
+			case 'toolOutputChunk':
+				this._emitToolOutput(record, event.callId, event.chunk);
+				return;
+			case 'backgroundTask':
+				this._handleBackgroundTask(record, event.snapshot as IManoxTaskSnapshot);
+				return;
+			case 'planUpdate':
+				this._emitPlanPart(record, event.snapshot);
+				return;
+			case 'planModeChange':
+				record.planMode = event.enabled;
+				return;
 		}
 	}
 
@@ -762,6 +796,91 @@ export class ManoxAgent extends Disposable implements IAgent {
 		totals.cacheRead += (data.cache_read_input_tokens ?? 0) + (data.cache_creation_input_tokens ?? 0);
 		totals.records += 1;
 		record.turnTokenUsage.set(turnId, totals);
+	}
+
+	/** Live tool output: accumulate chunks and push the running card's
+	 * content (the host replaces it wholesale; codex uses the same pattern). */
+	private _emitToolOutput(record: IManoxChatRecord, callId: string, chunk: string): void {
+		const accumulated = (record.toolOutputs.get(callId) ?? '') + chunk;
+		record.toolOutputs.set(callId, accumulated);
+		const turnId = record.currentTurnId ?? record.fallbackTurnId;
+		if (!turnId) {
+			return;
+		}
+		this._fire(record, {
+			type: ActionType.ChatToolCallContentChanged,
+			turnId,
+			toolCallId: callId,
+			content: [{ type: ToolResultContentType.Text, text: accumulated }],
+		});
+	}
+
+	/** Background tasks (monitors / background bash) ride a sentinel tool
+	 * card: started on first running snapshot, live tail via content
+	 * changes, settled once the task reaches a terminal status. */
+	private _handleBackgroundTask(record: IManoxChatRecord, snapshot: IManoxTaskSnapshot): void {
+		const cardId = `task:${snapshot.task_id}`;
+		const turnId = record.currentTurnId ?? record.fallbackTurnId ?? this._turnId(record);
+		const terminal = snapshot.status === 'Completed' || snapshot.status === 'Failed' || snapshot.status === 'TimedOut' || snapshot.status === 'Stopped' || snapshot.status === 'SessionEnded';
+		if (!record.backgroundStarted.has(snapshot.task_id)) {
+			record.backgroundStarted.add(snapshot.task_id);
+			this._fire(record, {
+				type: ActionType.ChatToolCallStart,
+				turnId,
+				toolCallId: cardId,
+				toolName: snapshot.kind,
+				displayName: snapshot.description || snapshot.kind,
+			});
+			this._fire(record, {
+				type: ActionType.ChatToolCallReady,
+				turnId,
+				toolCallId: cardId,
+				invocationMessage: snapshot.description || snapshot.kind,
+				confirmed: ToolCallConfirmationReason.NotNeeded,
+			});
+		}
+		if (!terminal) {
+			this._fire(record, {
+				type: ActionType.ChatToolCallContentChanged,
+				turnId,
+				toolCallId: cardId,
+				content: [{ type: ToolResultContentType.Text, text: snapshot.output_tail || `(${snapshot.status})` }],
+				_meta: { progressMessage: `${snapshot.kind}: ${snapshot.status}` },
+			});
+			this._fireToSession(record, { type: ActionType.SessionActivityChanged, activity: `Background: ${snapshot.description || snapshot.kind}` });
+			return;
+		}
+		const failed = snapshot.status === 'Failed' || snapshot.status === 'TimedOut';
+		this._fire(record, {
+			type: ActionType.ChatToolCallComplete,
+			turnId,
+			toolCallId: cardId,
+			result: {
+				pastTenseMessage: snapshot.description || snapshot.kind,
+				content: [{ type: ToolResultContentType.Text, text: snapshot.output_tail || snapshot.failure_summary || snapshot.status }],
+				success: !failed,
+			},
+		});
+		this._fireToSession(record, { type: ActionType.SessionActivityChanged, activity: undefined });
+	}
+
+	/** Plan snapshots render as markdown checklist parts (the host has no
+	 * structured plan surface; markdown task markers ARE the plan UI). */
+	private _emitPlanPart(record: IManoxChatRecord, snapshot: IManoxPlanSnapshot): void {
+		const turnId = record.currentTurnId ?? record.fallbackTurnId;
+		if (!turnId) {
+			return;
+		}
+		const glyph = (status: string): string => status === 'completed' ? '- [x] ' : status === 'in_progress' ? '- [ ] :running: ' : '- [ ] ';
+		const lines = [
+			...(snapshot.explanation ? [snapshot.explanation, ''] : []),
+			...snapshot.steps.map(step => `${glyph(step.status)}${step.step}`),
+		];
+		this._fire(record, {
+			type: ActionType.ChatResponsePart,
+			turnId,
+			part: { kind: ResponsePartKind.Markdown, id: `manox-plan-${++record.planPartCounter}`, content: lines.join('\n') },
+		});
 	}
 
 	/** Token usage per turn from the journal's token_usage metrics —
@@ -802,6 +921,7 @@ export class ManoxAgent extends Disposable implements IAgent {
 			// default (workspace-write). Mid-session switches are not wired yet
 			// (the host applies session config at creation; no write-back hook
 			// exists for providers), so the mode is fixed per session.
+			const configuredPlan = options?.config?.planMode === true;
 			const configuredMode = options?.config?.permissionMode;
 			const approvalMode: ManoxApprovalMode = isManoxApprovalMode(configuredMode) ? configuredMode : manoxDefaultApprovalMode();
 			let sessionId: string | undefined;
@@ -862,7 +982,15 @@ export class ManoxAgent extends Disposable implements IAgent {
 				cwd: workingDirectory?.fsPath,
 				lastEntryIdByTurn: new Map(),
 				turnTokenUsage: new Map(),
+				toolOutputs: new Map(),
+				planMode: false,
+				planPartCounter: 0,
+				backgroundStarted: new Set(),
 			};
+			record.planMode = configuredPlan;
+			if (configuredPlan) {
+				transport.sendNote({ method: 'setPlanMode', sessionId, enabled: true });
+			}
 			this._chats.set(chat.toString(), record);
 			transport.openStream(record.streamId, record.sessionId, MANOX_SNAPSHOT_WINDOW);
 			this._logService.info(`[manox] session ${record.sessionId} created for ${chat.toString()}`);
@@ -995,6 +1123,10 @@ export class ManoxAgent extends Disposable implements IAgent {
 			cwd: undefined,
 			lastEntryIdByTurn: new Map(),
 			turnTokenUsage: new Map(),
+			toolOutputs: new Map(),
+			planMode: false,
+			planPartCounter: 0,
+			backgroundStarted: new Set(),
 		};
 		// Attach server-side (replays any parked adjudications to this owner);
 		// the answer is only `{restored: true}` — history arrives through the
@@ -1007,12 +1139,18 @@ export class ManoxAgent extends Disposable implements IAgent {
 	// ---- Config / metadata / auth stubs ---------------------------------------
 
 	async resolveChatConfig(params: IAgentResolveChatConfigParams): Promise<ResolveSessionConfigResult> {
-		// The single manox-specific knob: the sandbox approval mode, applied
-		// at session creation (createChat reads options.config.permissionMode).
-		// Not sessionMutable yet — the platform has no provider write-back
-		// hook for mid-session config changes, so advertising mutability would
-		// render a picker that lies.
+		// manox knobs, both applied at session creation (createChat reads
+		// options.config): the sandbox approval mode and plan mode. The
+		// kernel accepts neither mid-turn, so both render read-only once
+		// the session exists (sessionMutable: false keeps the picker honest).
 		const sessionSchema = createSchema({
+			planMode: schemaProperty<boolean>({
+				type: 'boolean',
+				title: localize('manox.sessionConfig.planMode', "Plan Mode"),
+				description: localize('manox.sessionConfig.planModeDescription', "The agent drafts an executable plan for approval before making changes. Applied when the session starts."),
+				default: false,
+				sessionMutable: false,
+			}),
 			permissionMode: schemaProperty<ManoxApprovalMode>({
 				type: 'string',
 				title: localize('manox.sessionConfig.approvalMode', "Approvals"),
@@ -1033,6 +1171,7 @@ export class ManoxAgent extends Disposable implements IAgent {
 			}),
 		});
 		const values = sessionSchema.validateOrDefault(params.config ?? {}, {
+			planMode: false,
 			permissionMode: manoxDefaultApprovalMode(),
 		});
 		return { schema: sessionSchema.toProtocol(), values };
@@ -1242,6 +1381,9 @@ export class ManoxAgent extends Disposable implements IAgent {
 		record.turnActive = false;
 		record.turnStartedAt = undefined;
 		record.lastEntryIdByTurn.clear();
+		record.toolOutputs.clear();
+		record.backgroundStarted.clear();
+		record.planPartCounter = 0;
 		this._ensureConnected().openStream(record.streamId, sessionId, MANOX_SNAPSHOT_WINDOW);
 		this._onDidChangeChatData.fire({ chat, providerData: sessionId });
 	}
@@ -1314,6 +1456,7 @@ export class ManoxAgent extends Disposable implements IAgent {
 	private async _discoverExternalSessions(): Promise<void> {
 		try {
 			const threads = await this._ensureConnected().listThreads();
+			this._logService.info(`[manox] discovery raw rows: ${threads.length} (retry ${this._discoveryRetries})`);
 			// The store's initial scan is asynchronous: listThreads answers
 			// empty until it lands, and no threadsUpdated event follows the
 			// scan itself — a one-shot discovery would miss every session.
