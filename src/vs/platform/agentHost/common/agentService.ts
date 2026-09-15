@@ -390,6 +390,13 @@ export const AgentHostManoxHomeEnvVar = 'VSCODE_AGENT_HOST_MANOX_HOME';
  */
 export const AgentHostManoxApprovalModeEnvVar = 'VSCODE_AGENT_HOST_MANOX_APPROVAL_MODE';
 
+/**
+ * Experiment fork: the stock Copilot/Claude/Codex harnesses are disabled by
+ * default so the Agents Window is manox-only. Set to 'true' to register them
+ * alongside manox again.
+ */
+export const AgentHostOtherAgentsEnabledEnvVar = 'VSCODE_AGENT_HOST_OTHER_AGENTS_ENABLED';
+
 // -- OpenTelemetry settings ------------------------------------------------------
 //
 // The `chat.agentHost.otel.*` namespace surfaces the same exporter knobs the CLI
