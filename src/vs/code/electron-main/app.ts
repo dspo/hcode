@@ -1478,8 +1478,14 @@ export class CodeApplication extends Disposable {
 		const context = isLaunchedFromCli(process.env) ? OpenContext.CLI : OpenContext.DESKTOP;
 		const args = this.environmentMainService.args;
 
-		// Handle agents window first based on context
-		if (args['agents']) {
+		// Handle agents window first based on context. Experiment fork: a bare
+		// launch (no CLI openables, no protocol URLs) defaults straight into the
+		// Agents Window instead of the IDE; opt out with --no-agents, or pass
+		// folders/files/URLs to land in the editor as usual.
+		const openAgentsWindowFirst = args['agents'] === undefined
+			? args._.length === 0 && !initialProtocolUrls
+			: args['agents'];
+		if (openAgentsWindowFirst) {
 			return windowsMainService.openAgentsWindow({
 				context,
 				cli: args,

@@ -444,7 +444,10 @@ class SessionsSetUpWidget extends Disposable {
 				}
 			}
 		} else {
-			await this._showSignInDialog();
+			// Experiment fork: the non-first-launch path honors the same
+			// signed-out-when-usable flag as first launch, so the dialog's
+			// close affordance (X) is offered here too.
+			await this._showSignInDialog(this._allowSignedOutWhenUsable.get());
 		}
 
 		this.dialogRef.clear();

@@ -359,6 +359,44 @@ export const AgentHostCodexAgentCodexHomeEnvVar = 'CODEX_HOME';
 /** Forwarded extra args for `codex app-server` (JSON-encoded string[]). */
 export const AgentHostCodexAgentBinaryArgsEnvVar = 'VSCODE_AGENT_HOST_CODEX_APP_SERVER_ARGS';
 
+/**
+ * Experimental Manox agent harness. Points at a directory containing the
+ * locally built `manox_napi.node` addon (see the manox repo's
+ * `script/build-napi`). The addon is loaded only when
+ * {@link AgentHostManoxAgentEnabledEnvVar} enables the harness.
+ */
+export const AgentHostManoxSdkRootEnvVar = 'VSCODE_AGENT_HOST_MANOX_SDK_ROOT';
+
+/**
+ * Environment variable gate for the experimental Manox agent harness.
+ * Accepts `'true'` / `'false'`; absent means "default" (`false`).
+ */
+export const AgentHostManoxAgentEnabledEnvVar = 'VSCODE_AGENT_HOST_MANOX_AGENT_ENABLED';
+
+/**
+ * Redirects the manox state root (`MANOX_HOME` inside the agent core):
+ * runtime lock, `threads.db`, session journals, and provider config. Set it
+ * to an isolated directory so the harness never contends for the
+ * `~/.manox/runtime.lock` with a running manox app or another embedded host.
+ */
+export const AgentHostManoxHomeEnvVar = 'VSCODE_AGENT_HOST_MANOX_HOME';
+
+/**
+ * Approval mode manox sessions are created with (the manox permission
+ * vocabulary: `read-only` | `workspace-write` | `danger-full-access`).
+ * Defaults to `workspace-write`, so tool calls outside the granted-root
+ * fence surface as approval cards; set `danger-full-access` to run the
+ * experiment ungated. An invalid value falls back to the default.
+ */
+export const AgentHostManoxApprovalModeEnvVar = 'VSCODE_AGENT_HOST_MANOX_APPROVAL_MODE';
+
+/**
+ * Experiment fork: the stock Copilot/Claude/Codex harnesses are disabled by
+ * default so the Agents Window is manox-only. Set to 'true' to register them
+ * alongside manox again.
+ */
+export const AgentHostOtherAgentsEnabledEnvVar = 'VSCODE_AGENT_HOST_OTHER_AGENTS_ENABLED';
+
 // -- OpenTelemetry settings ------------------------------------------------------
 //
 // The `chat.agentHost.otel.*` namespace surfaces the same exporter knobs the CLI
