@@ -699,11 +699,15 @@ export class ManoxAgent extends Disposable implements IAgent {
 				return;
 			}
 			case 'turnFinish':
-			case 'stop':
-				// The kernel's settled-turn row is `stop` (reason end_turn &c);
-				// `turnFinish` is the stranded/cancelled variant. Both end the
-				// host turn — missing this pairing leaves the UI spinning.
 				this._endTurn(record);
+				return;
+			case 'stop':
+				// The kernel writes a `stop` row per model round: tool_use means
+				// the turn CONTINUES into tool execution; only end_turn settles
+				// the host turn (missing this pairing left the UI spinning).
+				if (event.reason === 'end_turn') {
+					this._endTurn(record);
+				}
 				return;
 			case 'error':
 				this._fire(record, {
