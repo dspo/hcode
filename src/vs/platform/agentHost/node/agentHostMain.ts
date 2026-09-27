@@ -27,6 +27,8 @@ import { ClaudeAgent } from './claude/claudeAgent.js';
 import { ClaudeSdkPackage } from './claude/claudeAgentSdkService.js';
 import { CodexAgent, CodexSdkPackage } from './codex/codexAgent.js';
 import { createCodexProviderConfiguration } from './codex/codexProviderConfiguration.js';
+import { ManoxAgent } from './manox/manoxAgent.js';
+import { isManoxAddonAvailable, MANOX_SDK_ROOT_ENV, resolveDefaultManoxSdkRoot } from './manox/manoxNapiTransport.js';
 import { ByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
 import { IAgentHostProxyResolver } from './agentHostProxyResolver.js';
 import { IAgentSdkDownloader, type IAgentSdkDownloadProgress } from './agentSdkDownloader.js';
@@ -188,6 +190,14 @@ async function startAgentHost(): Promise<void> {
 			};
 			registerCodexIfEnabled();
 			disposables.add(agentConfigurationService.onDidRootConfigChange(registerCodexIfEnabled));
+		}
+		// Manox is a native runtime embedded in-process over the napi AHP bridge:
+		// it needs no SDK download, so the only gate is its addon being reachable.
+		const manoxSdkRoot = process.env[MANOX_SDK_ROOT_ENV] ?? resolveDefaultManoxSdkRoot(environmentService.appRoot);
+		if (isManoxAddonAvailable(manoxSdkRoot)) {
+			providerService.registerProvider(instantiationService.createInstance(ManoxAgent));
+		} else {
+			logService.warn(`manox addon not found under '${manoxSdkRoot ?? ''}'; manox agent is not registered`);
 		}
 	} catch (err) {
 		logService.error('Failed to create AgentService', err);
