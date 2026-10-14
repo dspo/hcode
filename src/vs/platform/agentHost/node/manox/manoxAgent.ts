@@ -77,6 +77,21 @@ export class ManoxAgent extends Disposable implements IAgent {
 		process.env.MANOX_HOME = process.env[AgentHostManoxHomeEnvVar] ?? `${process.env['HOME'] ?? ''}/.manox`;
 		const client = new ManoxAhpClient(addonPath);
 		this._register(client.onAction(envelope => this._forwardAction(envelope)));
+		// The model catalog rides the root snapshot: manox exposes one agent
+		// entry per configured provider (cx.providers.config.yaml) — no
+		// separate configuration exists for the harness.
+		this._register(client.onDidRootAgents(agents => {
+			const models = agents.flatMap(agent => (agent.models ?? []).map(model => ({
+				provider: MANOX_AGENT_PROVIDER_ID,
+				id: model.id,
+				name: model.name ?? model.id,
+				...(typeof model.maxContextWindow === 'number' ? { maxContextWindow: model.maxContextWindow } : {}),
+				...(typeof model.maxOutputTokens === 'number' ? { maxOutputTokens: model.maxOutputTokens } : {}),
+				supportsVision: false,
+			})));
+			this._models.set(models, undefined);
+			this._logService.info(`[manox] model catalog: ${models.length} model(s) from ${agents.length} provider(s)`);
+		}));
 		void client.connect('vscode').then(() => {
 			this._logService.info('[manox] AHP initialized', JSON.stringify(client.initialized?._meta?.['x-manox'])?.slice(0, 120));
 		}, err => this._logService.warn('[manox] AHP initialize failed', err));
@@ -218,7 +233,9 @@ export class ManoxAgent extends Disposable implements IAgent {
 	respondToPermissionRequest(): void { }
 	respondToUserInputRequest(_requestId: string, _response: ChatInputResponseKind, _answers?: Record<string, ChatInputAnswer>): void { }
 
-	async refreshModels(): Promise<void> { }
+	async refreshModels(): Promise<void> {
+		await this._client?._refreshRootAgents();
+	}
 	private readonly _models = observableValue<readonly IAgentModelInfo[]>(this, []);
 	readonly models = this._models;
 

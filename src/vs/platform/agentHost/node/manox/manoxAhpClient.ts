@@ -64,6 +64,13 @@ export class ManoxAhpClient {
 	/** Initialized connection metadata (`_meta['x-manox']` included). */
 	initialized: { protocolVersion: string; serverSeq: number; _meta?: Record<string, unknown> } | undefined;
 
+	/** Root-snapshot agent catalog (one entry per configured provider; the
+	 * model list is read straight out of the manox provider config). */
+	private readonly _onDidRootAgents = new Emitter<readonly { provider: string; displayName?: string; models?: readonly { id: string; name?: string; maxContextWindow?: number; maxOutputTokens?: number }[] }[]>();
+	readonly onDidRootAgents = this._onDidRootAgents.event;
+	private _rootAgents: readonly { provider: string; displayName?: string; models?: readonly { id: string; name?: string; maxContextWindow?: number; maxOutputTokens?: number }[] }[] = [];
+	get rootAgents() { return this._rootAgents; }
+
 	constructor(addonPath: string) {
 		this._binding = createRequire(import.meta.url)(addonPath) as IManoxNapiBinding;
 	}
@@ -118,6 +125,7 @@ export class ManoxAhpClient {
 				protocolVersions: ['0.9.0'],
 				initialSubscriptions: ['ahp-root://'],
 			}).then(result => {
+				void this._refreshRootAgents();
 				this.initialized = result as { protocolVersion: string; serverSeq: number; _meta?: Record<string, unknown> };
 				if (!handshakeSettled) {
 					handshakeSettled = true;
@@ -130,6 +138,16 @@ export class ManoxAhpClient {
 				}
 			});
 		});
+	}
+
+	/** Re-read the agent catalog from the root snapshot (provider config). */
+	async _refreshRootAgents(): Promise<void> {
+		const subscribed = await this.request<{ snapshot?: { state?: { agents?: unknown } } }>('subscribe', { channel: 'ahp-root://' });
+		const agents = subscribed?.snapshot?.state?.agents as typeof this._rootAgents | undefined;
+		if (Array.isArray(agents)) {
+			this._rootAgents = agents;
+			this._onDidRootAgents.fire(agents);
+		}
 	}
 
 	private _handleNotification(method: string, params: Record<string, unknown>): void {
