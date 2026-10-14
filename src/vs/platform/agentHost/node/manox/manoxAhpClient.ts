@@ -75,8 +75,16 @@ export class ManoxAhpClient {
 		this._binding = createRequire(import.meta.url)(addonPath) as IManoxNapiBinding;
 	}
 
-	/** Start the runtime, run the initialize handshake and pump messages. */
-	async connect(clientId: string): Promise<void> {
+	private _connecting: Promise<void> | undefined;
+
+	/** Start the runtime, run the initialize handshake and pump messages.
+	 * Idempotent: concurrent and repeat calls await the first handshake. */
+	connect(clientId: string): Promise<void> {
+		this._connecting ??= this._connectOnce(clientId);
+		return this._connecting;
+	}
+
+	private async _connectOnce(clientId: string): Promise<void> {
 		await new Promise<void>((resolveHandshake, rejectHandshake) => {
 			let handshakeSettled = false;
 			this._binding.start(clientId, (err, raw) => {
@@ -140,13 +148,21 @@ export class ManoxAhpClient {
 		});
 	}
 
-	/** Re-read the agent catalog from the root snapshot (provider config). */
+	private _rootSessions: readonly { id?: string; title?: string; modifiedAt?: number }[] = [];
+	get rootSessions() { return this._rootSessions; }
+
+	/** Re-read the agent catalog and session list from the root snapshot. */
 	async _refreshRootAgents(): Promise<void> {
-		const subscribed = await this.request<{ snapshot?: { state?: { agents?: unknown } } }>('subscribe', { channel: 'ahp-root://' });
-		const agents = subscribed?.snapshot?.state?.agents as typeof this._rootAgents | undefined;
+		const subscribed = await this.request<{ snapshot?: { state?: { agents?: unknown; sessions?: unknown } } }>('subscribe', { channel: 'ahp-root://' });
+		const state = subscribed?.snapshot?.state as { agents?: unknown; sessions?: unknown } | undefined;
+		const agents = state?.agents as typeof this._rootAgents | undefined;
 		if (Array.isArray(agents)) {
 			this._rootAgents = agents;
 			this._onDidRootAgents.fire(agents);
+		}
+		const sessions = state?.sessions as typeof this._rootSessions | undefined;
+		if (Array.isArray(sessions)) {
+			this._rootSessions = sessions;
 		}
 	}
 

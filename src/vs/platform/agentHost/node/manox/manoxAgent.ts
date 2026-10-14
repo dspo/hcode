@@ -14,7 +14,7 @@ import { AgentHostManoxHomeEnvVar, AgentHostManoxSdkRootEnvVar } from '../../com
 import { AgentSession, resolveAgentChatContext, type AgentProvider, type AgentSignal, type IAgent, type IAgentCapabilities, type IAgentChatMetadata, type IAgentChats, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentDescriptor, type IAgentDiscoveredChat, type IAgentHostCapabilities, type IAgentModelInfo } from '../../common/agent.js';
 import type { ChatAction } from '../../common/state/protocol/channels-chat/actions.js';
 import type { SessionAction } from '../../common/state/sessionActions.js';
-import { parseChatUri, type ChatInputAnswer, ChatInputResponseKind, type ModelSelection, type Turn } from '../../common/state/sessionState.js';
+import { buildDefaultChatUri, parseChatUri, type ChatInputAnswer, ChatInputResponseKind, type ModelSelection, type Turn } from '../../common/state/sessionState.js';
 import type { ProtectedResourceMetadata } from '../../common/state/protocol/state.js';
 import { ManoxAhpClient, resolveManoxAddonPath } from './manoxAhpClient.js';
 
@@ -251,7 +251,29 @@ export class ManoxAgent extends Disposable implements IAgent {
 	respondToUserInputRequest(_requestId: string, _response: ChatInputResponseKind, _answers?: Record<string, ChatInputAnswer>): void { }
 
 	async refreshModels(): Promise<void> {
-		await this._client?._refreshRootAgents();
+		await this._refreshCatalog();
+	}
+
+	private async _refreshCatalog(): Promise<void> {
+		const client = this._client;
+		if (!client) {
+			return;
+		}
+		await client._refreshRootAgents();
+		// Surface the runtime's known sessions as external discovered chats so
+		// they reappear (and restore) after a restart.
+		const discovered = client.rootSessions
+			.filter(session => typeof session.id === 'string')
+			.map(session => ({
+				chat: URI.parse(buildDefaultChatUri(AgentSession.uri(this.id, session.id!))),
+				startTime: session.modifiedAt ?? Date.now(),
+				modifiedTime: session.modifiedAt ?? Date.now(),
+				...(session.title ? { summary: session.title } : {}),
+				external: true,
+			}));
+		if (discovered.length) {
+			this._onDidDiscoverChats.fire(discovered);
+		}
 	}
 	private readonly _models = observableValue<readonly IAgentModelInfo[]>(this, []);
 	readonly models = this._models;
