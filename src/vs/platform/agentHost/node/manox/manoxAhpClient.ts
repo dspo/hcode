@@ -113,6 +113,7 @@ export class ManoxAhpClient {
 				}
 			});
 			void this.request('initialize', {
+				channel: 'ahp-root://',
 				clientId,
 				protocolVersions: ['0.9.0'],
 				initialSubscriptions: ['ahp-root://'],
