@@ -11,10 +11,10 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { localize } from '../../../../nls.js';
 import { ILogService } from '../../../log/common/log.js';
 import { AgentHostManoxHomeEnvVar, AgentHostManoxSdkRootEnvVar } from '../../common/agentService.js';
-import { resolveAgentChatContext, type AgentProvider, type AgentSignal, type IAgent, type IAgentCapabilities, type IAgentChatMetadata, type IAgentChats, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentDescriptor, type IAgentDiscoveredChat, type IAgentHostCapabilities, type IAgentModelInfo } from '../../common/agent.js';
+import { AgentSession, resolveAgentChatContext, type AgentProvider, type AgentSignal, type IAgent, type IAgentCapabilities, type IAgentChatMetadata, type IAgentChats, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentDescriptor, type IAgentDiscoveredChat, type IAgentHostCapabilities, type IAgentModelInfo } from '../../common/agent.js';
 import type { ChatAction } from '../../common/state/protocol/channels-chat/actions.js';
 import type { SessionAction } from '../../common/state/sessionActions.js';
-import type { ChatInputAnswer, ChatInputResponseKind, ModelSelection, Turn } from '../../common/state/sessionState.js';
+import { parseChatUri, type ChatInputAnswer, ChatInputResponseKind, type ModelSelection, type Turn } from '../../common/state/sessionState.js';
 import type { ProtectedResourceMetadata } from '../../common/state/protocol/state.js';
 import { ManoxAhpClient, resolveManoxAddonPath } from './manoxAhpClient.js';
 
@@ -118,7 +118,12 @@ export class ManoxAgent extends Disposable implements IAgent {
 			const client = this._ensureConnected();
 			await client.connect('vscode');
 			const workingDirectory = options?.workingDirectories?.[0];
-			const channel = `ahp-session:/${generateUuid()}`;
+			// Derive the channel from the host's session id (encoded in the
+			// chat URI): restore can then rebuild the binding from the URI
+			// alone even when the persisted providerData was lost.
+			const parsedChat = parseChatUri(chat.toString());
+			const hostSessionId = parsedChat ? AgentSession.id(parsedChat.session) : generateUuid();
+			const channel = `ahp-session:/${hostSessionId}`;
 			await client.request('createSession', {
 				channel,
 				activeClient: { clientId: 'vscode' },
@@ -174,14 +179,26 @@ export class ManoxAgent extends Disposable implements IAgent {
 	// ---- Restore --------------------------------------------------------------
 
 	async materializeChat(chat: URI, _context: URI | import('../../common/agent.js').IAgentChatContext, providerData: string | undefined): Promise<IAgentCreateChatResult | void> {
-		if (!providerData) {
+		// Prefer the persisted providerData; fall back to the host session id
+		// encoded in the chat URI (channels are derived from it at creation).
+		const parsedChat = parseChatUri(chat.toString());
+		const channel = providerData
+			?? (parsedChat ? `ahp-session:/${AgentSession.id(parsedChat.session)}` : undefined);
+		if (!channel) {
 			return;
 		}
 		const client = this._ensureConnected();
 		await client.connect('vscode');
-		await client.request('subscribe', { channel: providerData });
-		this._channelByChat.set(chat.toString(), providerData);
-		this._chatByChannel.set(providerData, chat.toString());
+		try {
+			await client.request('subscribe', { channel });
+		} catch (err) {
+			// A session the runtime no longer knows (pre-v0.3 lineage, pruned
+			// state): leave the chat unbound rather than failing the restore.
+			this._logService.warn(`[manox] cannot re-subscribe ${channel}; leaving chat unbound`, err);
+			return;
+		}
+		this._channelByChat.set(chat.toString(), channel);
+		this._chatByChannel.set(channel, chat.toString());
 	}
 
 	// ---- Minimal stubs (progressive port onto the AHP surface) ----------------
