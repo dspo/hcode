@@ -28,7 +28,7 @@ import { ClaudeSdkPackage } from './claude/claudeAgentSdkService.js';
 import { CodexAgent, CodexSdkPackage } from './codex/codexAgent.js';
 import { createCodexProviderConfiguration } from './codex/codexProviderConfiguration.js';
 import { ManoxAgent } from './manox/manoxAgent.js';
-import { isManoxAddonAvailable } from './manox/manoxNapiTransport.js';
+import { isManoxAddonAvailable } from './manox/manoxAhpClient.js';
 import { ByokLmBridgeRegistry } from './byokLmBridgeRegistry.js';
 import { IAgentHostProxyResolver } from './agentHostProxyResolver.js';
 import { IAgentSdkDownloader, type IAgentSdkDownloadProgress } from './agentSdkDownloader.js';
