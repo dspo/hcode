@@ -200,7 +200,7 @@ async function startAgentHost(): Promise<void> {
 		// env vars; the addon resolves from VSCODE_AGENT_HOST_MANOX_SDK_ROOT or
 		// the default build location below (manox repo `script/build-napi`).
 		if (isAgentEnabled(process.env[AgentHostManoxAgentEnabledEnvVar], true)) {
-			const manoxSdkRoot = process.env[AgentHostManoxSdkRootEnvVar] ?? `${process.env['HOME'] ?? ''}/worktrees/manox/vscode-integ/target/napi`;
+			const manoxSdkRoot = process.env[AgentHostManoxSdkRootEnvVar] ?? `${process.env['HOME'] ?? ''}/worktrees/manox/hcode-v0.3/target/napi`;
 			if (isManoxAddonAvailable(manoxSdkRoot)) {
 				providerService.registerProvider(instantiationService.createInstance(ManoxAgent));
 			} else {
